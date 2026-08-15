@@ -1,0 +1,15 @@
+#IDE
+./trae/
+./vscode/
+./codex/
+
+#缓存
+./_pycache_/
+*cache*
+tmp/
+
+#测试用文件
+jsofttool.json
+auth0.json
+testmail.json
+test_bot_*.py

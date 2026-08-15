@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>mjb.botname - 实时状态监控</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="icon" href="/webui/icon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>mjb.botname - 实时状态监控</h1>
+        </div>
+        
+        <!-- 标签页 -->
+        <div class="tabs">
+            <button class="tab active" onclick="openTab(event, 'status-tab')">基本状态 <span class="live-indicator"></span></button>
+            <button class="tab" onclick="openTab(event, 'threads-tab')">线程详情</button>
+        </div>
+        
+        <!-- 基本状态标签页内容 -->
+        <div id="status-tab" class="tab-content active">
+            <div class="status-section">
+                <h2>实时状态信息</h2>
+                <div class="status-info">
+                    <div class="status-card">
+                        <h3>Bot状态</h3>
+                        <div class="value" id="bot-status">--</div>
+                    </div>
+                    <div class="status-card">
+                        <h3>线程数量</h3>
+                        <div class="value" id="thread-count">--</div>
+                    </div>
+                    <div class="status-card">
+                        <h3>运行时间</h3>
+                        <div class="value" id="uptime">--</div>
+                    </div>
+                    <div class="status-card">
+                        <h3>CPU占用</h3>
+                        <div class="value" id="cpu-usage">--</div>
+                    </div>
+                    <div class="status-card">
+                        <h3>内存占用</h3>
+                        <div class="value" id="memory-usage">--</div>
+                    </div>
+                    <div class="status-card">
+                        <h3>上次回传时间</h3>
+                        <div class="value" id="last-heartbeat-time">--</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 线程详情标签页内容 -->
+        <div id="threads-tab" class="tab-content">
+            <div class="threads-section">
+                <h2>线程监控</h2>
+                <div class="table-container">
+                    <table id="threads-table">
+                        <thead>
+                            <tr>
+                                <th>线程名称</th>
+                                <th>线程ID</th>
+                                <th>状态</th>
+                                <th>守护线程</th>
+                            </tr>
+                        </thead>
+                        <tbody id="threads-body">
+                            <tr>
+                                <td colspan="4" style="text-align: center; color: #999;">
+                                    <div class="loading">
+                                        <div class="loading-spinner"></div>
+                                        加载中...
+                                    </div>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>© 2024-2025 Jsoft Studio</p>
+            <p>内核版本：mjb.mjbcore.ver</p>
+        </div>
+    </div>
+
+    <script src="js/utils.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>

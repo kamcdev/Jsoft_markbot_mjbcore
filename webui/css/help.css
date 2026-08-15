@@ -1,0 +1,158 @@
+/* 全局样式 */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Microsoft YaHei', sans-serif;
+    background-image: url('../background_help.png');
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    min-height: 100vh;
+    color: #333;
+}
+
+/* 容器 */
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+/* 头部样式 */
+header {
+    text-align: center;
+    margin-bottom: 40px;
+}
+
+h1 {
+    color: white;
+    font-size: 2.5rem;
+    margin-bottom: 10px;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+}
+
+.version {
+    color: white;
+    font-size: 1rem;
+    margin-bottom: 20px;
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.5);
+}
+
+.divider {
+    border: none;
+    border-top: 2px solid white;
+    width: 80%;
+    margin: 0 auto;
+    box-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
+}
+
+/* 命令容器 */
+#commands-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 30px;
+    justify-items: center;
+    align-items: start;
+}
+
+/* 命令分类卡片 */
+.command-category {
+    background: white;
+    border-radius: 15px;
+    border: 2px solid black;
+    width: 100%;
+    max-width: 350px;
+    overflow: hidden;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.command-category:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.4);
+}
+
+/* 分类标题 */
+.category-title {
+    background: black;
+    color: white;
+    padding: 15px;
+    text-align: center;
+    font-size: 1.2rem;
+    font-weight: bold;
+    margin-bottom: 10px;
+}
+
+/* 命令列表 */
+.commands-list {
+    padding: 0 15px 15px;
+}
+
+/* 单个命令项 */
+.command-item {
+    margin-bottom: 15px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #eee;
+}
+
+.command-item:last-child {
+    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: none;
+}
+
+.command-name {
+    font-weight: bold;
+    color: #333;
+    margin-bottom: 5px;
+    font-size: 1rem;
+}
+
+.command-desc {
+    color: #666;
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+
+/* 响应式设计 */
+@media (max-width: 768px) {
+    h1 {
+        font-size: 2rem;
+    }
+    
+    .version {
+        font-size: 0.9rem;
+    }
+    
+    #commands-container {
+        grid-template-columns: 1fr;
+        gap: 20px;
+    }
+    
+    .command-category {
+        max-width: 100%;
+    }
+}
+
+@media (max-width: 480px) {
+    h1 {
+        font-size: 1.8rem;
+    }
+    
+    .container {
+        padding: 15px;
+    }
+    
+    .category-title {
+        font-size: 1.1rem;
+        padding: 12px;
+    }
+    
+    .commands-list {
+        padding: 0 10px 10px;
+    }
+}
