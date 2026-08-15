@@ -27,8 +27,18 @@ def init():
     botname = mjbconfig.get_botname()
     version = mjbconfig.get_version()
 
+    mjbcoretitle = r"""
+                   _     __                              
+   ____ ___       (_)   / /_   _____  ____    _____  ___ 
+  / __ `__ \     / /   / __ \ / ___/ / __ \  / ___/ / _ \
+ / / / / / /    / /   / /_/ // /__  / /_/ / / /    /  __/
+/_/ /_/ /_/  __/ /   /_.___/ \___/  \____/ /_/     \___/ 
+            /___/                                                                            
+    """
+
+    print(mjbcoretitle)
     logger.info("=" * 50)
-    logger.info(f"硫酸钠BOT 内核启动 | 内核版本: {version}")
+    logger.info(f"mjbcore 内核启动 | 内核版本: {version}")
     logger.info(f"机器人QQ: {botid} | 名称: {botname}")
     logger.info("=" * 50)
 
