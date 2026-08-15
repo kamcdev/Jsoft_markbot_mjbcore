@@ -15,7 +15,9 @@ _BANUSER_FILE = os.path.join(_ROOT, "banuser.json")
 _GPEVENT_FILE = os.path.join(_ROOT, "gpevent.json")
 _GPAUTHS_FILE = os.path.join(_ROOT, "gpauths.json")
 
-# LLbotQQ HTTP API 地址
+# LLbotQQ HTTP API 地址（send_port 从 group.json 读取，默认 3002）
+_send_port = 3002
+_webhook_port = 9762
 _LLbot_URL = "http://127.0.0.1:3002"
 
 # ---- 运行时状态 ----
@@ -73,6 +75,14 @@ def register_reload_hook(fn):
 
 def get_LLbot_url():
     return _LLbot_URL
+
+
+def get_webhook_port():
+    return _webhook_port
+
+
+def get_send_port():
+    return _send_port
 
 
 def get_config():
@@ -210,6 +220,7 @@ def _apply_group_data(group_data):
     global gpauthgroups, gpauthfrequency, gpauthtime, gpauth_configs
     global autowelgps_list, gpwel_configs, autorecallgps_list, gprecall_configs
     global fkgps_list, gpfk_configs, group_admin_commands, bot_admin_commands, webui_dir
+    global _send_port, _webhook_port, _LLbot_URL
 
     botid = str(group_data.get("bqq", 0))
     botname = str(group_data.get("botname", "硫酸钠"))
@@ -258,6 +269,11 @@ def _apply_group_data(group_data):
             webui_dir = webui_path
         if not os.path.exists(webui_dir):
             webui_dir = None
+
+    # Webhook 端口和 HTTP 发送端口（从 group.json 读取）
+    _webhook_port = int(group_data.get("webhook_port", 9762))
+    _send_port = int(group_data.get("send_port", 3002))
+    _LLbot_URL = f"http://127.0.0.1:{_send_port}"
 
 
 def load():

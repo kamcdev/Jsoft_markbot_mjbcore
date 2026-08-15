@@ -275,8 +275,8 @@ def start():
     # 注册 reload 回调（供 mjb.reload 命令调用）
     mjbc.set_reload_callback(reload_all)
 
-    logger.info("Webhook 服务启动，监听端口 9762")
-    socket.run(port=9762)
+    logger.info(f"Webhook 服务启动，监听端口 {mjbconfig.get_webhook_port()}")
+    socket.run()
 
 
 def _send_startup_notice():

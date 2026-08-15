@@ -83,8 +83,13 @@ def _safe_handle(data):
         logger.error(f"消息处理失败: {e}")
 
 
-def run(port=9762):
-    """启动 uvicorn 服务（阻塞主线程）"""
+def run(port=None):
+    """启动 uvicorn 服务（阻塞主线程）
+
+    port 为 None 时从 mjbconfig 读取 webhook_port（group.json 配置）。
+    """
+    if port is None:
+        port = mjbconfig.get_webhook_port()
     app = get_app()
     logger.info(f"Webhook 服务启动在端口 {port}")
     try:
