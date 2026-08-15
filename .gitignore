@@ -1,10 +1,10 @@
 #IDE
-./trae/
-./vscode/
-./codex/
+.trae/
+.vscode/
+.codex/
 
 #缓存
-./_pycache_/
+_pycache_/
 *cache*
 tmp/
 
@@ -13,3 +13,4 @@ jsofttool.json
 auth0.json
 testmail.json
 test_bot_*.py
+bin/compile.py
