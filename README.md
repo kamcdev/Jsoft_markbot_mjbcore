@@ -36,8 +36,6 @@
 
 这是一款使用OneBot11客户端，基于Python开发的QQ机器人框架
 
-推荐使用LLonebot客户端进行对接，本程序大部分适配都在这个客户端上
-
 问题反馈可提交issue（荐）或联系邮箱[manyj@jsoftstudio.top](mailto:manyj@jsoftstudio.top)
 
 可自行开发插件扩展功能
