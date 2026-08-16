@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+import ctypes
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 from bin import logger
@@ -109,15 +111,42 @@ def stop_background(name):
     return False
 
 
+def _force_stop_thread(t, retries=3, interval=0.5):
+    tid = t.ident
+    if tid is None or t is threading.current_thread():
+        logger.error(f"无法强制终止线程 {t.name}: 无效线程ID或为当前线程")
+        return False
+    for _ in range(retries):
+        if not t.is_alive():
+            return True
+        try:
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(tid), ctypes.py_object(SystemExit))
+            if res == 0:
+                logger.error(f"强制终止线程 {t.name} 失败: 无效线程ID {tid}")
+                return False
+            if res > 1:
+                # 理论上不会发生；若发生则撤销注入，避免线程被多次打断
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(tid), None)
+                logger.error(f"强制终止线程 {t.name} 异常: 注入异常计数 {res}")
+                return False
+        except Exception as e:
+            logger.error(f"强制终止线程 {t.name} 出错: {e}")
+            return False
+        time.sleep(interval)
+    return not t.is_alive()
+
+
 def stop_all_background(wait=True, timeout=5):
     """停止所有后台线程，等待退出后清理登记表
 
     用于 reload_all：确保旧线程彻底退出后再重新加载模块，避免线程重复创建。
     对无停止机制的线程（如 WebUI Flask）仅记录警告，不阻塞。
+    join 超时仍未退出的线程会被强制终止（注入 SystemExit）。
 
     Args:
         wait: 是否 join 等待线程结束
-        timeout: 每个线程 join 超时秒数
+        timeout: 每个线程 join 超时秒数，超时后强制终止
     """
     with _bg_lock:
         entries = dict(_background_threads)
@@ -147,7 +176,11 @@ def stop_all_background(wait=True, timeout=5):
             if t and t.is_alive() and t is not threading.current_thread():
                 t.join(timeout=timeout)
                 if t.is_alive():
-                    logger.warning(f"后台线程 {name} 在 {timeout}s 后仍未结束")
+                    logger.warning(f"后台线程 {name} 在 {timeout}s 后仍未结束，尝试强制关闭")
+                    if _force_stop_thread(t):
+                        logger.info(f"后台线程 {name} 已被强制关闭")
+                    else:
+                        logger.error(f"后台线程 {name} 强制关闭失败，仍存活")
                 else:
                     logger.info(f"后台线程 {name} 已退出")
 
