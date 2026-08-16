@@ -244,7 +244,7 @@ def _apply_group_data(group_data):
     global _runtime_commandsinfo, _runtime_commandscategory
 
     botid = str(group_data.get("bqq", 0))
-    botname = str(group_data.get("botname", "硫酸钠"))
+    botname = str(group_data.get("botname", "mjbcore"))
     version = str(group_data.get("version", "1.0.0"))
     listening_qq_list = _to_list(group_data.get("listeningqq", ""))
     target_group = str(group_data.get("group", ""))
