@@ -8,6 +8,7 @@ from datetime import datetime
 
 # ---- 颜色定义（ANSI 转义码）----
 _RESET = "\x1b[0m"
+_NAME_COLOR = "\x1b[94m"  # 来源颜色：亮蓝
 _COLORS = {
     logging.DEBUG: "\x1b[36m",      # 青色
     logging.INFO: "\x1b[32m",       # 绿色
@@ -32,7 +33,7 @@ except Exception:
 
 
 class _ColorFormatter(logging.Formatter):
-    """带颜色的日志格式器：时间 级别 [模块] 消息"""
+    """带颜色的日志格式器：时间 级别 [来源] 消息"""
 
     def __init__(self):
         super().__init__(
@@ -41,16 +42,73 @@ class _ColorFormatter(logging.Formatter):
         )
 
     def format(self, record):
-        color = _COLORS.get(record.levelno, "")
-        original = super().format(record)
-        if color:
-            return f"{color}{original}{_RESET}"
-        return original
+        # 时间：默认白色
+        try:
+            dt = datetime.fromtimestamp(record.created)
+            time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            time_str = record.asctime
+
+        # 级别：按级别着色
+        level_color = _COLORS.get(record.levelno, _RESET)
+        level_str = f"{record.levelname:<7}"
+
+        # 来源：统一着色
+        name_str = f"[{record.name}]"
+
+        # 消息：默认白色，附带异常堆栈/栈信息
+        msg = record.getMessage()
+        if record.exc_info and not record.exc_text:
+            record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            msg = f"{msg}\n{record.exc_text}"
+        if record.stack_info:
+            msg = f"{msg}\n{self.formatStack(record.stack_info)}"
+
+        return (f"{time_str} {level_color}{level_str}{_RESET} "
+                f"{_NAME_COLOR}{name_str}{_RESET} {msg}")
+
+
+def _detect_source_name():
+    """向上遍历调用栈，检测日志调用来源"""
+    try:
+        _logging_dir = os.path.dirname(os.path.abspath(logging.__file__))
+        _self_file = os.path.abspath(__file__)
+        frame = sys._getframe(1)
+        while frame:
+            filename = frame.f_code.co_filename
+            abs_path = os.path.abspath(filename)
+            frame = frame.f_back
+            # 跳过本模块与 logging 库内部帧
+            if abs_path == _self_file or abs_path.startswith(_logging_dir):
+                continue
+            # 首个外部调用帧：位于 modules/ 目录则作为插件名
+            if os.sep + "modules" + os.sep in abs_path:
+                base = os.path.basename(filename)
+                if base.endswith(".py"):
+                    return base[:-3]
+            return None
+        return None
+    except Exception:
+        return None
+
+
+class _SourceNameFilter(logging.Filter):
+    """动态设置日志来源：插件调用显示插件名，核心调用保持 mjbcore"""
+
+    def filter(self, record):
+        source = _detect_source_name()
+        if source:
+            record.name = source
+        return True
 
 
 def _build_logger():
     lg = logging.getLogger("mjbcore")
     if lg.handlers:
+        # 重新加载场景：补挂来源过滤器，避免重复
+        if not any(isinstance(f, _SourceNameFilter) for f in lg.filters):
+            lg.addFilter(_SourceNameFilter())
         return lg
     lg.setLevel(logging.DEBUG)
     handler = logging.StreamHandler()
@@ -58,6 +116,7 @@ def _build_logger():
     handler.setFormatter(_ColorFormatter())
     lg.addHandler(handler)
     lg.propagate = False
+    lg.addFilter(_SourceNameFilter())
     return lg
 
 
@@ -78,10 +137,7 @@ critical = logger.critical
 
 
 def supereye_log_command(group_id, user_id, command_name, command_args, permission_level):
-    """全视系统：记录命令执行日志到 usage_records.txt
-
-    与原 supereye_log_command 行为一致：一行记录，两个记录之间空一行。
-    """
+    """全视系统：记录命令执行日志到 usage_records.txt"""
     try:
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         args_str = " ".join(command_args) if command_args else ""
