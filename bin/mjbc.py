@@ -10,15 +10,27 @@ command_functions = {}
 
 
 def register_command(func_name, func):
-    """注册单个命令函数"""
+    """注册单个命令函数，支持顶替内置命令，插件注册同名函数（如 cmd_autogpwel）会覆盖内置命令函数，优先级大于内置"""
     command_functions[func_name] = func
+    if func_name.startswith("cmd_"):
+        short = func_name[4:]
+        if short:
+            command_functions[short] = func
+    else:
+        command_functions[f"cmd_{func_name}"] = func
     logger.debug(f"已注册命令函数: {func_name}")
 
 
 def register_commands(mapping):
-    """批量注册命令函数 {func_name: func}"""
+    """批量注册命令函数 {func_name: func}（同 register_command 的双名注册语义）"""
     for func_name, func in mapping.items():
         command_functions[func_name] = func
+        if func_name.startswith("cmd_"):
+            short = func_name[4:]
+            if short:
+                command_functions[short] = func
+        else:
+            command_functions[f"cmd_{func_name}"] = func
 
 
 def clear_commands():
