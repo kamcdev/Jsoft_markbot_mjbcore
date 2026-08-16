@@ -118,14 +118,13 @@ def _create_app():
     @app.route("/api/commands", methods=["GET"])
     def get_commands():
         try:
-            group_data = mjbconfig.get_config()
             result = {
-                "commands": group_data.get("commands", {}),
-                "commandsinfo": group_data.get("commandsinfo", {}),
-                "commandscategory": group_data.get("commandscategory", {}),
-                "bot_admin_commands": group_data.get("bot_admin_commands", []),
-                "group_admin_commands": group_data.get("group_admin_commands", []),
-                "commandshidden": group_data.get("commandshidden", []),
+                "commands": mjbconfig.get_commands_map(),
+                "commandsinfo": mjbconfig.get_commandsinfo(),
+                "commandscategory": mjbconfig.get_commandscategory(),
+                "bot_admin_commands": mjbconfig.get_bot_admin_commands(),
+                "group_admin_commands": mjbconfig.get_group_admin_commands(),
+                "commandshidden": mjbconfig.get_commandshidden(),
                 "version": mjbconfig.get_version(),
             }
             return jsonify(result)

@@ -32,6 +32,8 @@ version = ""
 listening_qq_list = []
 target_group = ""
 commands_map = {}
+_runtime_commandsinfo = {}      # autoreg 临时注册的命令简介（不写入配置文件）
+_runtime_commandscategory = {}  # autoreg 临时注册的命令分类（不写入配置文件）
 admin_list = []
 bangroup_list = []
 autosinggps_list = []
@@ -120,6 +122,24 @@ def get_target_group():
 
 def get_commands_map():
     return commands_map
+
+
+def get_commandsinfo():
+    """返回合并后的命令简介：group.json 优先，autoreg 补充"""
+    result = dict(_runtime_commandsinfo)
+    cfg_info = _config.get("commandsinfo", {})
+    if isinstance(cfg_info, dict):
+        result.update(cfg_info)
+    return result
+
+
+def get_commandscategory():
+    """返回合并后的命令分类：group.json 优先，autoreg 补充"""
+    result = dict(_runtime_commandscategory)
+    cfg_cat = _config.get("commandscategory", {})
+    if isinstance(cfg_cat, dict):
+        result.update(cfg_cat)
+    return result
 
 
 def get_admin_list():
@@ -221,6 +241,7 @@ def _apply_group_data(group_data):
     global autowelgps_list, gpwel_configs, autorecallgps_list, gprecall_configs
     global fkgps_list, gpfk_configs, group_admin_commands, bot_admin_commands, webui_dir
     global _send_port, _webhook_port, _LLbot_URL
+    global _runtime_commandsinfo, _runtime_commandscategory
 
     botid = str(group_data.get("bqq", 0))
     botname = str(group_data.get("botname", "硫酸钠"))
@@ -232,6 +253,10 @@ def _apply_group_data(group_data):
     if isinstance(commands_data, dict):
         commands_map.clear()
         commands_map.update(commands_data)
+
+    # 重置 autoreg 临时注册的运行时变量（reload 时清空旧值）
+    _runtime_commandsinfo.clear()
+    _runtime_commandscategory.clear()
 
     onimagehelp = bool(group_data.get("onimagehelp", True))
     banrepgroup_list = _to_list(group_data.get("banrepgroup", []))
@@ -339,10 +364,10 @@ def reload():
 
 
 def apply_module_autoreg(autoreg, module_name=""):
-    """将模块 modcfg().autoreg 中的命令注册表合并到运行时状态
+    """将模块 modcfg().autoreg 中的命令注册表合并到运行时状态（不写入配置文件）
 
-    autoreg 作为模块自带的"默认注册表"，group.json 已有的项优先
-    （用户可在 group.json 中覆盖模块默认：改名/改简介/禁用等）。
+    autoreg 作为模块自带的"默认注册表"，仅在运行时变量中临时注册，
+    group.json 已有的项优先（用户可在 group.json 中覆盖模块默认：改名/改简介/禁用等）。
 
     支持的字段（与 group.json 同名同结构）：
         commands              dict   触发词 -> 函数名
@@ -357,6 +382,7 @@ def apply_module_autoreg(autoreg, module_name=""):
         module_name: 模块名（仅用于日志）
     """
     global commandshidden, group_admin_commands, bot_admin_commands
+    global _runtime_commandsinfo, _runtime_commandscategory
 
     if not isinstance(autoreg, dict):
         return
@@ -364,65 +390,54 @@ def apply_module_autoreg(autoreg, module_name=""):
     prefix = f"[模块{module_name}]" if module_name else "[autoreg]"
     merged_keys = []
 
-    # commands 合并到 commands_map 与 _config["commands"]
+    # commands 合并到运行时 commands_map（不写 _config）
     autoreg_commands = autoreg.get("commands", {})
     if isinstance(autoreg_commands, dict):
-        cfg_commands = _config.setdefault("commands", {})
         for key, value in autoreg_commands.items():
-            if key not in cfg_commands and key not in commands_map:
-                cfg_commands[key] = value
+            if key not in commands_map:
                 commands_map[key] = value
         merged_keys.append(f"commands={list(autoreg_commands.keys())}")
 
-    # commandsinfo 合并
+    # commandsinfo 合并到运行时变量（group.json 中已有的项优先）
     autoreg_info = autoreg.get("commandsinfo", {})
     if isinstance(autoreg_info, dict):
-        cfg_info = _config.setdefault("commandsinfo", {})
+        cfg_info = _config.get("commandsinfo", {})
         for key, value in autoreg_info.items():
-            if key not in cfg_info:
-                cfg_info[key] = value
+            if key not in cfg_info and key not in _runtime_commandsinfo:
+                _runtime_commandsinfo[key] = value
         merged_keys.append(f"commandsinfo={len(autoreg_info)}项")
 
-    # commandscategory 合并
+    # commandscategory 合并到运行时变量（group.json 中已有的项优先）
     autoreg_cat = autoreg.get("commandscategory", {})
     if isinstance(autoreg_cat, dict):
-        cfg_cat = _config.setdefault("commandscategory", {})
+        cfg_cat = _config.get("commandscategory", {})
         for key, value in autoreg_cat.items():
-            if key not in cfg_cat:
-                cfg_cat[key] = value
+            if key not in cfg_cat and key not in _runtime_commandscategory:
+                _runtime_commandscategory[key] = value
         merged_keys.append(f"commandscategory={len(autoreg_cat)}项")
 
-    # bot_admin_commands 合并
+    # bot_admin_commands 合并到运行时变量（不写 _config）
     autoreg_bot_admin = _to_list(autoreg.get("bot_admin_commands", []))
     if autoreg_bot_admin:
-        cfg_bot_admin = _config.setdefault("bot_admin_commands", [])
         for cmd in autoreg_bot_admin:
             if cmd not in bot_admin_commands:
                 bot_admin_commands.append(cmd)
-            if cmd not in cfg_bot_admin:
-                cfg_bot_admin.append(cmd)
         merged_keys.append(f"bot_admin_commands={autoreg_bot_admin}")
 
-    # group_admin_commands 合并
+    # group_admin_commands 合并到运行时变量（不写 _config）
     autoreg_group_admin = _to_list(autoreg.get("group_admin_commands", []))
     if autoreg_group_admin:
-        cfg_group_admin = _config.setdefault("group_admin_commands", [])
         for cmd in autoreg_group_admin:
             if cmd not in group_admin_commands:
                 group_admin_commands.append(cmd)
-            if cmd not in cfg_group_admin:
-                cfg_group_admin.append(cmd)
         merged_keys.append(f"group_admin_commands={autoreg_group_admin}")
 
-    # commandshidden 合并
+    # commandshidden 合并到运行时变量（不写 _config）
     autoreg_hidden = _to_list(autoreg.get("commandshidden", []))
     if autoreg_hidden:
-        cfg_hidden = _config.setdefault("commandshidden", [])
         for cmd in autoreg_hidden:
             if cmd not in commandshidden:
                 commandshidden.append(cmd)
-            if cmd not in cfg_hidden:
-                cfg_hidden.append(cmd)
         merged_keys.append(f"commandshidden={autoreg_hidden}")
 
     if merged_keys:

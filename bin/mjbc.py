@@ -3,7 +3,7 @@ import os
 import json
 import random
 
-from bin import logger, mjbconfig, send, mjbmenu, mjbstatus, mjbutils, mjbtmpfile
+from bin import logger, mjbconfig, send, mjbmenu, mjbstatus, mjbutils, mjbtmpfile, worker
 
 # 命令分发表：func_name -> 可调用对象
 command_functions = {}
@@ -52,7 +52,7 @@ def dispatch(cmd_name, group_id, user_id, config_data, *cmd_args):
         True  - cmd_name 是已注册命令（无论是否被权限/禁用拦截）
         False - cmd_name 不是命令（交给关键词流程）
     """
-    commands_map = config_data.get("commands", {}) if config_data else mjbconfig.get_commands_map()
+    commands_map = mjbconfig.get_commands_map()
     if cmd_name not in commands_map:
         return False
 
@@ -97,6 +97,91 @@ def dispatch(cmd_name, group_id, user_id, config_data, *cmd_args):
     return True
 
 
+def _get_user_roles(group_id, user_id, config_data):
+    """获取用户角色：是否为 bot 管理员 / 群管理员（群主或管理员）"""
+    admin_list = mjbutils.get_admin_list_from_config(config_data)
+    is_bot_admin = str(user_id) in admin_list
+    is_group_admin = False
+    try:
+        role = send.get_group_member_role(group_id, user_id)
+        is_group_admin = role in ("owner", "admin")
+    except Exception as e:
+        logger.error(f"获取群成员身份时出错: {e}")
+    return is_bot_admin, is_group_admin
+
+
+def _render_help_image(group_id, showhidden, is_bot_admin, is_group_admin):
+    """在线程池中用无头浏览器渲染帮助菜单 HTML 并截图发送
+
+    流程：生成 HTML -> 写临时文件 -> Selenium(Edge headless) 渲染并全页截图 -> 发图 -> 清理
+    """
+    import time
+
+    html_path = None
+    png_path = None
+    driver = None
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.edge.options import Options
+
+        html_content = mjbmenu.generate_html(showhidden, is_bot_admin, is_group_admin)
+        html_path = mjbtmpfile.create(suffix=".html", prefix="help_")
+        png_path = mjbtmpfile.create(suffix=".png", prefix="help_")
+        if not html_path or not png_path:
+            send.group(group_id, "帮助图片生成失败：无法创建临时文件")
+            return
+
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+        # file:// URI（Windows 路径反斜杠需转为正斜杠）
+        file_uri = "file:///" + os.path.abspath(html_path).replace(os.sep, "/")
+
+        options = Options()
+        options.add_argument('--headless=new')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--window-size=760,1080')
+
+        driver = webdriver.Edge(options=options)
+        driver.set_page_load_timeout(15)
+        driver.get(file_uri)
+
+        # 等待字体与布局就绪
+        time.sleep(1)
+
+        # 全页截图：将窗口高度调整为内容实际高度后截图
+        try:
+            total_height = driver.execute_script(
+                "return Math.max(document.body.scrollHeight, "
+                "document.documentElement.scrollHeight);")
+            driver.set_window_size(760, int(total_height))
+            time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"获取页面高度失败: {e}")
+
+        driver.save_screenshot(png_path)
+        logger.info(f"帮助图片已生成: {png_path}")
+
+        success = send.group_image(group_id, png_path)
+        if not success:
+            send.group(group_id, "帮助图片发送失败")
+    except Exception as e:
+        logger.error(f"渲染帮助图片失败: {e}")
+        send.group(group_id, f"帮助图片生成失败: {e}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        if html_path and os.path.exists(html_path):
+            mjbtmpfile.cleanup_now(html_path)
+        if png_path and os.path.exists(png_path):
+            mjbtmpfile.cleanup_now(png_path)
+
+
 # ===================== 内置核心命令 =====================
 def cmd_help(group_id, user_id, config_data, *args):
     """显示帮助信息，根据用户权限显示不同命令列表"""
@@ -105,14 +190,7 @@ def cmd_help(group_id, user_id, config_data, *args):
 
     # -h/-H 或关闭图片帮助 → 文字帮助
     if (len(args) > 0 and args[0] in ("-h", "-H")) or not onimagehelp:
-        admin_list = mjbutils.get_admin_list_from_config(config_data)
-        is_bot_admin = str(user_id) in admin_list
-        is_group_admin = False
-        try:
-            role = send.get_group_member_role(group_id, user_id)
-            is_group_admin = role in ("owner", "admin")
-        except Exception as e:
-            logger.error(f"获取群成员身份时出错: {e}")
+        is_bot_admin, is_group_admin = _get_user_roles(group_id, user_id, config_data)
 
         result = mjbmenu.generate(config_data, is_bot_admin, is_group_admin, showhidden)
         try:
@@ -131,20 +209,11 @@ def cmd_help(group_id, user_id, config_data, *args):
             send.send_group_forward_msg(group_id, [result["help_text"]], fake_name="命令帮助")
             return "已发送帮助信息"
     else:
-        # 图片帮助
-        help_image_path = "help_showhidden.png" if showhidden else "help.png"
-        try:
-            if os.path.exists(help_image_path):
-                send.group_image(group_id, help_image_path)
-                return "已发送帮助图片"
-            if os.path.exists("help.png"):
-                send.group_image(group_id, "help.png")
-                return "已发送帮助图片"
-            send.group(group_id, "帮助图片不存在，请联系管理员")
-            return "帮助图片不存在"
-        except Exception as e:
-            logger.error(f"发送帮助图片失败: {e}")
-            return "发送帮助图片失败"
+        # 图片帮助：无头浏览器渲染 HTML 截图
+        is_bot_admin, is_group_admin = _get_user_roles(group_id, user_id, config_data)
+        worker.submit(_render_help_image, group_id, showhidden, is_bot_admin, is_group_admin)
+        send.group(group_id, "正在生成帮助图片，请稍候...")
+        return "帮助图片生成任务已启动"
 
 
 def cmd_test(group_id, user_id, config_data, *args):

@@ -38,7 +38,7 @@ def init():
 
     print(mjbcoretitle)
     logger.info("=" * 50)
-    logger.info(f"mjbcore 内核启动 | 内核版本: {version}")
+    logger.info(f"硫酸钠BOT 内核启动 | 内核版本: {version}")
     logger.info(f"机器人QQ: {botid} | 名称: {botname}")
     logger.info("=" * 50)
 
