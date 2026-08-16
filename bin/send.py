@@ -296,3 +296,22 @@ def send_poke(group_id, user_id):
     except Exception as e:
         logger.error(f"戳一戳失败: {e}")
         return {"status": "error", "message": str(e)}
+
+
+def set_group_special_title(group_id, user_id, special_title=""):
+    """设置群成员专属头衔（special_title 为空字符串表示去掉群头衔）"""
+    try:
+        return api("set_group_special_title", group_id=int(group_id),
+                   user_id=int(user_id), special_title=special_title)
+    except Exception as e:
+        logger.error(f"设置群头衔失败: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def set_essence_msg(message_id):
+    """设置群精华消息"""
+    try:
+        return api("set_essence_msg", message_id=int(message_id))
+    except Exception as e:
+        logger.error(f"设置群精华消息失败: {e}")
+        return {"status": "error", "message": str(e)}
