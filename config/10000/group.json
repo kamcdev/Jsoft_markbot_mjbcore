@@ -16,8 +16,6 @@
     "ffmpeg_path": "在此处设置ffmpeg路径",
     "webui_path": "webui",
     "bot_path": "在此处设置bot本体程序(bot_v1_1.x.x.py)所在路径",
-    "webhook_port": 9762,
-    "send_port": 3002,
     "plugin_list": [],
     "commands": {
         "help": "help",
