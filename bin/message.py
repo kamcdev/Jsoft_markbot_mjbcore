@@ -12,9 +12,18 @@ _interceptors = []          # 消息拦截器（有序）：fn(ctx) -> bool(是�
 _at_bot_handlers = []       # @bot 处理器：fn(ctx) -> bool(是否已处理)
 _notice_handlers = {}       # notice_type -> [fn(ctx)]
 
-# QQ 心跳信息（与 1.0.2 一致，供 WebUI /api/status 判断连接状态）
+# QQ 心跳信息（多账号：bot_id -> info；None 键保留给无账号旧场景）
 _heartbeat_lock = threading.Lock()
-_heartbeat_info = {"online": False, "interval": 0, "timestamp": 0, "raw_status": {}}
+_heartbeat_info = {}  # bot_id -> {"online":bool,"interval":int,"timestamp":float,"raw_status":{}}
+
+
+def _get_heartbeat_key(data):
+    """从心跳事件数据中解析账号 key（优先 self_id，回退当前线程上下文）"""
+    self_id = data.get("self_id")
+    if self_id is not None:
+        return str(self_id)
+    cur = mjbconfig.get_current_bot_id()
+    return cur  # 可能为 None（旧场景）
 
 
 def register_interceptor(fn):
@@ -128,7 +137,13 @@ def _build_ctx(data, message_type):
 
 
 def handle_event(data):
-    """Webhook 事件总入口"""
+    """Webhook 事件总入口
+
+    账号上下文由 socket._safe_handle -> worker.submit 的 _run 统一管理
+    （提交时快照调用方账号，任务运行时恢复，finally 还原）。
+    本函数不再 set/clear 线程上下文，避免在异步任务/后台线程启动前过早清除，
+    也避免与 worker.submit 的上下文管理产生冲突。
+    """
     post_type = data.get("post_type")
     if post_type == "message":
         message_type = data.get("message_type", "未知")
@@ -146,31 +161,67 @@ def handle_event(data):
 
 
 def handle_meta_event(data):
-    """处理元事件（心跳），更新连接状态供 WebUI 判断（与 1.0.2 一致）"""
+    """处理元事件（心跳），按账号分别更新连接状态供 WebUI 判断"""
     meta_event_type = data.get("meta_event_type", "")
     if meta_event_type == "heartbeat":
         status = data.get("status", {})
         interval = data.get("interval", 0)
+        key = _get_heartbeat_key(data)
+        info_entry = {
+            "online": status.get("online", True),
+            "interval": interval,
+            "timestamp": datetime.now().timestamp(),
+            "raw_status": status,
+        }
         with _heartbeat_lock:
-            _heartbeat_info.update({
-                "online": status.get("online", True),
-                "interval": interval,
-                "timestamp": datetime.now().timestamp(),
-                "raw_status": status,
-            })
-        logger.debug(f"心跳事件: online={_heartbeat_info['online']}, interval={interval}ms")
+            _heartbeat_info[key] = info_entry
+        logger.debug(f"心跳事件[{key}]: online={info_entry['online']}, interval={interval}ms")
 
 
-def get_heartbeat_info():
-    """获取心跳信息副本（带 5 秒超时检测，与 1.0.2 一致）"""
-    current_ts = datetime.now().timestamp()
-    with _heartbeat_lock:
-        info = _heartbeat_info.copy()
-    if info.get("timestamp", 0) > 0 and (current_ts - info["timestamp"]) >= 5:
+def _expire_heartbeat(info):
+    """对单个心跳副本做超时检测
+
+    超时阈值按账号心跳间隔动态计算：max(5, interval*2 + 5) 秒，
+    避免多账号心跳上报时刻错开时被误判为 offline。
+    interval 为 OneBot 协议字段，单位毫秒。
+    """
+    ts = info.get("timestamp", 0)
+    if ts <= 0:
         info["online"] = False
-    elif info.get("timestamp", 0) == 0:
+        return info
+    interval_ms = info.get("interval", 0) or 0
+    threshold = max(5.0, interval_ms * 2 / 1000.0 + 5.0)
+    if (datetime.now().timestamp() - ts) >= threshold:
         info["online"] = False
     return info
+
+
+def get_heartbeat_info(bot_id=None):
+    """获取指定账号心跳副本（带动态超时检测）
+
+    bot_id 为 None 时返回默认账号心跳（向后兼容旧调用）。
+    """
+    if bot_id is None:
+        bot_id = mjbconfig.get_default_bot_id()
+    with _heartbeat_lock:
+        info = _heartbeat_info.get(str(bot_id)) if bot_id is not None else None
+        info = info.copy() if info else {}
+    if not info:
+        info = {"online": False, "interval": 0, "timestamp": 0, "raw_status": {}}
+    return _expire_heartbeat(info)
+
+
+def get_all_heartbeat_info():
+    """获取所有账号心跳副本（带 5 秒超时检测）
+
+    Returns:
+        dict: {bot_id: info}（key 为字符串账号 ID；可能包含 None 键）
+    """
+    with _heartbeat_lock:
+        snapshot = {k: v.copy() for k, v in _heartbeat_info.items()}
+    for k, v in snapshot.items():
+        _expire_heartbeat(v)
+    return snapshot
 
 
 def handle_request(data):
@@ -191,6 +242,11 @@ def handle_group_message(data):
     user_id = ctx["user_id"]
     raw_message = ctx["raw_message"]
     config_data = ctx["config_data"]
+
+    # 记录群-账号映射，供后台线程/定时任务中 send.group 无上下文时回退查找账号
+    self_id = data.get("self_id")
+    if self_id is not None and group_id is not None:
+        mjbconfig.register_group_account(group_id, self_id)
 
     testmode = mjbconfig.get_testmode()
     testgp = mjbconfig.get_testgp()

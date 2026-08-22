@@ -276,31 +276,43 @@ function refreshStatus() {
             return response.json();
         })
         .then(data => {
-            // 检查是否有正常的heartbeat心跳元数据（现在是对象，检查online字段）
-            const hasValidHeartbeat = data.success && data.data && data.data.heartbeat && data.data.heartbeat.online === true;
-            
+            // 心跳聚合字段（多账号）：online_count/offline_count/total_count
+            const hb = (data.data && data.data.heartbeat) || {};
+            const onlineCount = hb.online_count || 0;
+            const offlineCount = hb.offline_count || 0;
+            const totalCount = hb.total_count || 0;
+
+            // 多账号状态判定：
+            // - totalCount == 0：从未收到任何账号心跳，视为未正确连接
+            // - onlineCount == 0 且 totalCount > 0：全部账号异常，进入错误红屏
+            // - 其它：至少有一个账号在线
+            const hasValidHeartbeat = data.success && data.data && totalCount > 0 && onlineCount > 0;
+
             if (hasValidHeartbeat) {
                 // 更新最后一次心跳回传时间
                 lastHeartbeatTime = new Date();
-                
-                // 有正常心跳，恢复正常状态
+
+                // 至少有一个账号在线，恢复正常显示
                 if (isConnectionError) {
                     restoreNormalStatus();
                 }
-                
-                // 恢复正常状态指示灯
-                statusIndicator.style.backgroundColor = '#4CAF50';
-                
-                // 更新基本状态（无论当前显示哪个标签页都更新）
-                document.getElementById('bot-status').textContent = data.data.bot_status === 'running' ? '运行中' : '已停止';
+
+                // 状态指示灯：全在线绿色，部分异常橙色
+                if (offlineCount === 0) {
+                    statusIndicator.style.backgroundColor = '#4CAF50';
+                } else {
+                    statusIndicator.style.backgroundColor = '#ff9800';
+                }
+
+                // 更新Bot状态：显示“<正常>正常/<异常>异常”
+                document.getElementById('bot-status').textContent = `${onlineCount}正常/${offlineCount}异常`;
                 document.getElementById('thread-count').textContent = data.data.thread_count;
                 document.getElementById('uptime').textContent = data.data.uptime;
-                
-                // 获取QQ心跳时间戳并更新显示
-                const heartbeatTime = data.data.heartbeat && data.data.heartbeat.timestamp ? 
-                    new Date(data.data.heartbeat.timestamp * 1000) : lastHeartbeatTime;
+
+                // 心跳时间戳优先取默认账号
+                const heartbeatTime = hb.timestamp ? new Date(hb.timestamp * 1000) : lastHeartbeatTime;
                 document.getElementById('last-heartbeat-time').textContent = formatDateTime(heartbeatTime);
-                
+
                 // 更新CPU和内存占用
                 if (data.data.cpu_usage !== undefined) {
                     document.getElementById('cpu-usage').textContent = data.data.cpu_usage;
@@ -308,7 +320,7 @@ function refreshStatus() {
                 if (data.data.memory_usage !== undefined) {
                     document.getElementById('memory-usage').textContent = data.data.memory_usage;
                 }
-                
+
                 // 获取到真实信息后再替换默认值
                 if (data.data.bot_name) {
                     // 替换页面标题和头部标题中的bot名称
@@ -318,7 +330,7 @@ function refreshStatus() {
                         headerTitle.textContent = headerTitle.textContent.replace('mjb.botname', data.data.bot_name);
                     }
                 }
-                
+
                 if (data.data.version) {
                     // 替换页脚中的版本号
                     const versionText = document.querySelector('.footer p:last-child');

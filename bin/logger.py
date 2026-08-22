@@ -93,6 +93,15 @@ def _detect_source_name():
         return None
 
 
+def _get_current_account():
+    """获取当前线程的账号 bot_id（惰性导入 + 静默兜底，防循环导入与启动早期异常）"""
+    try:
+        from bin import mjbconfig as _m
+        return _m.get_current_bot_id()
+    except Exception:
+        return None
+
+
 class _SourceNameFilter(logging.Filter):
     """动态设置日志来源：插件调用显示插件名，核心调用保持 mjbcore"""
 
@@ -100,6 +109,13 @@ class _SourceNameFilter(logging.Filter):
         source = _detect_source_name()
         if source:
             record.name = source
+        # 统一注入账号前缀（线程局部账号上下文）；已带相同前缀则跳过，防重复
+        bot_id = _get_current_account()
+        if bot_id:
+            prefix = f"[账号{bot_id}]"
+            if not record.getMessage().startswith(prefix):
+                record.msg = f"{prefix} {record.getMessage()}"
+                record.args = ()
         return True
 
 

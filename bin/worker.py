@@ -4,7 +4,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from bin import logger
+from bin import logger, mjbconfig
 
 # 命令执行线程池
 _executor = None
@@ -27,8 +27,29 @@ def _ensure_executor(max_workers=16):
 
 
 def submit(fn, *args, **kwargs):
-    """提交任务到线程池执行，返回 Future"""
-    return _ensure_executor().submit(fn, *args, **kwargs)
+    """提交任务到线程池执行，返回 Future
+
+    提交时在调用线程快照当前账号上下文（mjbconfig.get_current_bot_id()），
+    任务在池内线程执行前恢复该上下文，执行后清理（finally 还原原值），
+    保证任务内无参调用 mjbconfig getter 路由到提交方的账号。
+    """
+    bot_id = mjbconfig.get_current_bot_id()
+
+    def _run():
+        prev = mjbconfig.get_current_bot_id()
+        try:
+            if bot_id is not None:
+                mjbconfig.set_current_bot_id(bot_id)
+            else:
+                mjbconfig.clear_current_bot_id()
+            return fn(*args, **kwargs)
+        finally:
+            if prev is None:
+                mjbconfig.clear_current_bot_id()
+            else:
+                mjbconfig.set_current_bot_id(prev)
+
+    return _ensure_executor().submit(_run)
 
 
 def start_background(name, target, args=(), kwargs=None, daemon=True, stop_attr=None, stop_event=None):
@@ -47,7 +68,25 @@ def start_background(name, target, args=(), kwargs=None, daemon=True, stop_attr=
         kwargs = {}
     if stop_event is not None:
         kwargs['stop_event'] = stop_event
-    t = threading.Thread(target=target, args=args, kwargs=kwargs, name=name, daemon=daemon)
+    # 快照创建线程时的账号上下文，注入到线程目标：后台线程内无参调用
+    # mjbconfig getter 时路由到创建方账号（无上下文时用默认账号）
+    bot_id = mjbconfig.get_current_bot_id()
+
+    def _target():
+        prev = mjbconfig.get_current_bot_id()
+        try:
+            if bot_id is not None:
+                mjbconfig.set_current_bot_id(bot_id)
+            else:
+                mjbconfig.clear_current_bot_id()
+            return target(*args, **kwargs)
+        finally:
+            if prev is None:
+                mjbconfig.clear_current_bot_id()
+            else:
+                mjbconfig.set_current_bot_id(prev)
+
+    t = threading.Thread(target=_target, name=name, daemon=daemon)
     with _bg_lock:
         _background_threads[name] = {
             "thread": t,

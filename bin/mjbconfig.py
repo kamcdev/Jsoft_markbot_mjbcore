@@ -1,70 +1,78 @@
 # -*- coding: utf-8 -*-
 import os
 import json
+import threading
 
 from bin import logger
 
 # ---- 路径常量 ----
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根目录
-_GROUP_FILE = os.path.join(_ROOT, "group.json")
-_CONFIG_FILE = os.path.join(_ROOT, "config.json")
-_MODULES_CONFIG_DIR = os.path.join(_ROOT, "modules", "config")
+_ACCOUNT_FILE = os.path.join(_ROOT, "account.json")   # 账号列表 {QQ: {webhook_port, send_port}}
+_CONFIG_DIR = os.path.join(_ROOT, "config")           # 账号配置目录 config/<bot_id>/
+_CONFIG_FILE = os.path.join(_ROOT, "config.json")     # 全局 config.json（保留在根目录）
 
-# 核心配置文件（保留在根目录）
-_BANUSER_FILE = os.path.join(_ROOT, "banuser.json")
-_GPEVENT_FILE = os.path.join(_ROOT, "gpevent.json")
-_GPAUTHS_FILE = os.path.join(_ROOT, "gpauths.json")
+# 默认端口（account.json / group.json 均未配置时使用）
+_DEFAULT_WEBHOOK_PORT = 9762
+_DEFAULT_SEND_PORT = 3002
 
-# LLbotQQ HTTP API 地址（send_port 从 group.json 读取，默认 3002）
-_send_port = 3002
-_webhook_port = 9762
-_LLbot_URL = "http://127.0.0.1:3002"
+# ---- 账号列表（account.json）----
+_accounts = {}  # bot_id(str) -> {"webhook_port": int, "send_port": int}
 
-# ---- 运行时状态 ----
-_config = {}                 # group.json 完整 dict
-_config_config = {}          # config.json dict
-_config_last_modified = 0.0
+# ---- 运行时状态：每账号独立（config/<bot_id>/group.json）----
+_account_states = {}  # bot_id(str) -> state dict（见 _new_state）
 
-# 归一化后的派生状态
-botid = ""
-botname = ""
-version = ""
-listening_qq_list = []
-target_group = ""
-commands_map = {}
-_runtime_commandsinfo = {}      # autoreg 临时注册的命令简介（不写入配置文件）
-_runtime_commandscategory = {}  # autoreg 临时注册的命令分类（不写入配置文件）
-# autoreg 运行时合并缓存：模块加载时写入，配置热重载时重新应用，避免命令丢失
-_autoreg_commands = {}
-_autoreg_commandsinfo = {}
-_autoreg_commandscategory = {}
-_autoreg_bot_admin = []
-_autoreg_group_admin = []
-_autoreg_hidden = []
-admin_list = []
-bangroup_list = []
-autosinggps_list = []
-banrepgroup_list = []
-testgp = ""
-testmode = False
-commandshidden = []
-onimagehelp = True
-gpauthgroups = []
-gpauthfrequency = 3
-gpauthtime = 300
-gpauth_configs = {}
-autowelgps_list = []
-gpwel_configs = {}
-autorecallgps_list = []
-gprecall_configs = {}
-fkgps_list = []
-gpfk_configs = {}
-group_admin_commands = []
-bot_admin_commands = []
-webui_dir = None
-
-# 模块重载钩子
+# 模块重载钩子（全局共享）
 _reload_hooks = []
+
+# ---- 线程局部当前账号上下文 ----
+_tls = threading.local()
+
+
+def _new_state():
+    """创建一份空白账号状态（全部派生字段的默认值）"""
+    return {
+        "config": {},                 # group.json 完整 dict（live，随 reload 更新）
+        "config_config": {},          # 根目录 config.json dict
+        "config_last_modified": 0.0,
+        "botid": "",
+        "botname": "",
+        "version": "",
+        "listening_qq_list": [],
+        "target_group": "",
+        "commands_map": {},
+        "runtime_commandsinfo": {},      # autoreg 临时注册的命令简介（不写入配置文件）
+        "runtime_commandscategory": {},  # autoreg 临时注册的命令分类（不写入配置文件）
+        "autoreg_commands": {},          # autoreg 合并缓存：热重载时重新应用
+        "autoreg_commandsinfo": {},
+        "autoreg_commandscategory": {},
+        "autoreg_bot_admin": [],
+        "autoreg_group_admin": [],
+        "autoreg_hidden": [],
+        "admin_list": [],
+        "bangroup_list": [],
+        "autosinggps_list": [],
+        "banrepgroup_list": [],
+        "testgp": "",
+        "testmode": False,
+        "commandshidden": [],
+        "onimagehelp": True,
+        "gpauthgroups": [],
+        "gpauthfrequency": 3,
+        "gpauthtime": 300,
+        "gpauth_configs": {},
+        "autowelgps_list": [],
+        "gpwel_configs": {},
+        "autorecallgps_list": [],
+        "gprecall_configs": {},
+        "fkgps_list": [],
+        "gpfk_configs": {},
+        "group_admin_commands": [],
+        "bot_admin_commands": [],
+        "webui_dir": None,
+        "webhook_port": _DEFAULT_WEBHOOK_PORT,
+        "send_port": _DEFAULT_SEND_PORT,
+        "LLbot_URL": f"http://127.0.0.1:{_DEFAULT_SEND_PORT}",
+    }
 
 
 def _to_list(data):
@@ -76,306 +84,514 @@ def _to_list(data):
     return []
 
 
-def register_reload_hook(fn):
-    """模块注册重载钩子，reload() 时会调用以重载模块自身数据"""
-    if fn not in _reload_hooks:
-        _reload_hooks.append(fn)
+# ===================== 账号列表（account.json） =====================
+def load_accounts():
+    """读取根目录 account.json，格式 {QQ: {webhook_port, send_port}}"""
+    global _accounts
+    _accounts = {}
+    if os.path.exists(_ACCOUNT_FILE):
+        try:
+            with open(_ACCOUNT_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for bot_id, ports in raw.items():
+                    if not isinstance(ports, dict):
+                        ports = {}
+                    _accounts[str(bot_id)] = {
+                        "webhook_port": int(ports.get("webhook_port", _DEFAULT_WEBHOOK_PORT)),
+                        "send_port": int(ports.get("send_port", _DEFAULT_SEND_PORT)),
+                    }
+        except Exception as e:
+            logger.error(f"读取 account.json 失败: {e}")
+    if not _accounts:
+        # 回退：从 config/ 目录自动发现账号
+        _discover_accounts_from_config_dir()
+    return _accounts
 
 
-def get_LLbot_url():
-    return _LLbot_URL
+def _discover_accounts_from_config_dir():
+    """account.json 缺失/为空时，从 config/<QQ>/ 目录自动发现账号（端口用默认值）"""
+    if not os.path.isdir(_CONFIG_DIR):
+        return
+    for name in sorted(os.listdir(_CONFIG_DIR)):
+        full = os.path.join(_CONFIG_DIR, name)
+        if os.path.isdir(full) and name != "modcfg" and os.path.exists(os.path.join(full, "group.json")):
+            if name not in _accounts:
+                _accounts[name] = {
+                    "webhook_port": _DEFAULT_WEBHOOK_PORT,
+                    "send_port": _DEFAULT_SEND_PORT,
+                }
 
 
-def get_webhook_port():
-    return _webhook_port
+def get_accounts():
+    """返回账号列表 dict：{bot_id: {"webhook_port": int, "send_port": int}}"""
+    if not _accounts:
+        load_accounts()
+    return dict(_accounts)
 
 
-def get_send_port():
-    return _send_port
+def get_account_list():
+    """返回账号 bot_id 列表（有序）"""
+    return list(get_accounts().keys())
 
 
-def get_config():
-    """返回 group.json 实时 dict（live，随 reload 更新）"""
-    return _config
+def get_default_bot_id():
+    """默认账号 = account.json 第一个账号；无账号时回退 config/ 目录第一个子目录"""
+    accounts = get_accounts()
+    if accounts:
+        return next(iter(accounts))
+    if os.path.isdir(_CONFIG_DIR):
+        for name in sorted(os.listdir(_CONFIG_DIR)):
+            full = os.path.join(_CONFIG_DIR, name)
+            if os.path.isdir(full) and name != "modcfg":
+                return name
+    return None
 
 
-def get(key, default=None):
-    return _config.get(key, default)
+# ===================== 当前账号上下文（线程局部） =====================
+def set_current_bot_id(bot_id):
+    """设置当前线程的账号上下文（收信处理 / worker 任务开始时调用）"""
+    _tls.bot_id = str(bot_id)
 
 
-def get_config_config():
-    return _config_config
+def get_current_bot_id():
+    """返回当前线程的账号上下文 bot_id（未设置返回 None）"""
+    return getattr(_tls, "bot_id", None)
 
 
-def get_botid():
-    return botid
+def clear_current_bot_id():
+    """清除当前线程的账号上下文"""
+    if hasattr(_tls, "bot_id"):
+        del _tls.bot_id
 
 
-def get_botname():
-    return botname
+def _resolve_bot_id(bot_id=None):
+    """解析 bot_id：显式指定 > 当前线程上下文 > 默认账号"""
+    if bot_id is not None:
+        return str(bot_id)
+    cur = get_current_bot_id()
+    if cur:
+        return cur
+    return get_default_bot_id()
 
 
-def get_version():
-    return version
+# ===================== 群-账号映射（后台线程/定时任务回退用） =====================
+# 收到群消息时记录 group_id -> bot_id，供 send.group 等函数在无线程上下文时回退查找
+_group_account_map = {}
 
 
-def get_listening_qq_list():
-    return listening_qq_list
+def register_group_account(group_id, bot_id):
+    """记录群-账号映射（收到群消息时调用）"""
+    if group_id is None or bot_id is None:
+        return
+    _group_account_map[str(group_id)] = str(bot_id)
 
 
-def get_target_group():
-    return target_group
+def get_bot_id_by_group(group_id):
+    """根据群号查找关联的账号 bot_id（未找到返回 None）
+
+    用于后台线程/定时任务中调用 send.group 时，无线程上下文回退查找。
+    同一群若被多账号管理，映射会被后收到的消息覆盖；
+    多账号同群场景应由调用方显式传 bot_id。
+    """
+    if group_id is None:
+        return None
+    return _group_account_map.get(str(group_id))
 
 
-def get_commands_map():
-    return commands_map
+def resolve_bot_id_by_group(group_id, bot_id=None):
+    """群号辅助解析 bot_id：显式参数 > 线程上下文 > 群号映射 > 默认账号
+
+    供 send.py 的 _url 在 bot_id=None 且无线程上下文时回退使用。
+    """
+    if bot_id is not None:
+        return str(bot_id)
+    cur = get_current_bot_id()
+    if cur:
+        return cur
+    if group_id is not None:
+        mapped = get_bot_id_by_group(group_id)
+        if mapped:
+            return mapped
+    return get_default_bot_id()
 
 
-def get_commandsinfo():
+def _get_state(bot_id=None):
+    """获取账号状态 dict（不存在时创建空白状态，保证 getter 可用）"""
+    resolved = _resolve_bot_id(bot_id)
+    if resolved is None:
+        return None
+    state = _account_states.get(resolved)
+    if state is None:
+        state = _new_state()
+        _account_states[resolved] = state
+    return state
+
+
+# ===================== 账号文件路径 =====================
+def _account_dir(bot_id):
+    return os.path.join(_CONFIG_DIR, str(bot_id))
+
+
+def _group_file(bot_id):
+    return os.path.join(_account_dir(bot_id), "group.json")
+
+
+def _modcfg_dir(bot_id):
+    return os.path.join(_account_dir(bot_id), "modcfg")
+
+
+def _core_config_file(bot_id, name):
+    return os.path.join(_account_dir(bot_id), name)
+
+
+# ===================== 端口与 API 地址 =====================
+def _resolve_ports(bot_id):
+    """按优先级计算账号端口：account.json > group.json > 默认值"""
+    webhook_port = None
+    send_port = None
+    acc = get_accounts().get(str(bot_id), {})
+    if isinstance(acc, dict):
+        webhook_port = acc.get("webhook_port")
+        send_port = acc.get("send_port")
+    if webhook_port is None or send_port is None:
+        gfile = _group_file(bot_id)
+        if os.path.exists(gfile):
+            try:
+                with open(gfile, "r", encoding="utf-8") as f:
+                    gdata = json.load(f)
+                if isinstance(gdata, dict):
+                    if webhook_port is None:
+                        webhook_port = gdata.get("webhook_port")
+                    if send_port is None:
+                        send_port = gdata.get("send_port")
+            except Exception:
+                pass
+    if webhook_port is None:
+        webhook_port = _DEFAULT_WEBHOOK_PORT
+    if send_port is None:
+        send_port = _DEFAULT_SEND_PORT
+    return int(webhook_port), int(send_port)
+
+
+def get_LLbot_url(bot_id=None):
+    state = _get_state(bot_id)
+    if state is not None and state["LLbot_URL"]:
+        return state["LLbot_URL"]
+    resolved = _resolve_bot_id(bot_id)
+    if resolved:
+        _, send_port = _resolve_ports(resolved)
+        return f"http://127.0.0.1:{send_port}"
+    return f"http://127.0.0.1:{_DEFAULT_SEND_PORT}"
+
+
+def get_webhook_port(bot_id=None):
+    state = _get_state(bot_id)
+    if state is not None and state["webhook_port"]:
+        return state["webhook_port"]
+    resolved = _resolve_bot_id(bot_id)
+    if resolved:
+        webhook_port, _ = _resolve_ports(resolved)
+        return webhook_port
+    return _DEFAULT_WEBHOOK_PORT
+
+
+def get_send_port(bot_id=None):
+    state = _get_state(bot_id)
+    if state is not None and state["send_port"]:
+        return state["send_port"]
+    resolved = _resolve_bot_id(bot_id)
+    if resolved:
+        _, send_port = _resolve_ports(resolved)
+        return send_port
+    return _DEFAULT_SEND_PORT
+
+
+# ===================== 通用 getter（按当前账号状态读取，签名向后兼容） =====================
+def get_config(bot_id=None):
+    """返回当前账号 group.json 实时 dict（live，随 reload 更新）"""
+    state = _get_state(bot_id)
+    return state["config"] if state else {}
+
+
+def get(key, default=None, bot_id=None):
+    state = _get_state(bot_id)
+    return state["config"].get(key, default) if state else default
+
+
+def get_config_config(bot_id=None):
+    state = _get_state(bot_id)
+    return state["config_config"] if state else {}
+
+
+def get_botid(bot_id=None):
+    state = _get_state(bot_id)
+    return state["botid"] if state else ""
+
+
+def get_botname(bot_id=None):
+    state = _get_state(bot_id)
+    return state["botname"] if state else ""
+
+
+def get_version(bot_id=None):
+    state = _get_state(bot_id)
+    return state["version"] if state else ""
+
+
+def get_listening_qq_list(bot_id=None):
+    state = _get_state(bot_id)
+    return state["listening_qq_list"] if state else []
+
+
+def get_target_group(bot_id=None):
+    state = _get_state(bot_id)
+    return state["target_group"] if state else ""
+
+
+def get_commands_map(bot_id=None):
+    state = _get_state(bot_id)
+    return state["commands_map"] if state else {}
+
+
+def get_commandsinfo(bot_id=None):
     """返回合并后的命令简介：group.json 优先，autoreg 补充"""
-    result = dict(_runtime_commandsinfo)
-    cfg_info = _config.get("commandsinfo", {})
+    state = _get_state(bot_id)
+    if state is None:
+        return {}
+    result = dict(state["runtime_commandsinfo"])
+    cfg_info = state["config"].get("commandsinfo", {})
     if isinstance(cfg_info, dict):
         result.update(cfg_info)
     return result
 
 
-def get_commandscategory():
+def get_commandscategory(bot_id=None):
     """返回合并后的命令分类：group.json 优先，autoreg 补充"""
-    result = dict(_runtime_commandscategory)
-    cfg_cat = _config.get("commandscategory", {})
+    state = _get_state(bot_id)
+    if state is None:
+        return {}
+    result = dict(state["runtime_commandscategory"])
+    cfg_cat = state["config"].get("commandscategory", {})
     if isinstance(cfg_cat, dict):
         result.update(cfg_cat)
     return result
 
 
-def get_admin_list():
-    return admin_list
+def get_admin_list(bot_id=None):
+    state = _get_state(bot_id)
+    return state["admin_list"] if state else []
 
 
-def get_bangroup_list():
-    return bangroup_list
+def get_bangroup_list(bot_id=None):
+    state = _get_state(bot_id)
+    return state["bangroup_list"] if state else []
 
 
-def get_autosinggps_list():
-    return autosinggps_list
+def get_autosinggps_list(bot_id=None):
+    state = _get_state(bot_id)
+    return state["autosinggps_list"] if state else []
 
 
-def get_testgp():
-    return testgp
+def get_testgp(bot_id=None):
+    state = _get_state(bot_id)
+    return state["testgp"] if state else ""
 
 
-def get_testmode():
-    return testmode
+def get_testmode(bot_id=None):
+    state = _get_state(bot_id)
+    return state["testmode"] if state else False
 
 
-def get_commandshidden():
-    return commandshidden
+def get_commandshidden(bot_id=None):
+    state = _get_state(bot_id)
+    return state["commandshidden"] if state else []
 
 
-def get_onimagehelp():
-    return onimagehelp
+def get_onimagehelp(bot_id=None):
+    state = _get_state(bot_id)
+    return state["onimagehelp"] if state else True
 
 
-def get_gpauthgroups():
-    return gpauthgroups
+def get_gpauthgroups(bot_id=None):
+    state = _get_state(bot_id)
+    return state["gpauthgroups"] if state else []
 
 
-def get_gpauthfrequency():
-    return gpauthfrequency
+def get_gpauthfrequency(bot_id=None):
+    state = _get_state(bot_id)
+    return state["gpauthfrequency"] if state else 3
 
 
-def get_gpauthtime():
-    return gpauthtime
+def get_gpauthtime(bot_id=None):
+    state = _get_state(bot_id)
+    return state["gpauthtime"] if state else 300
 
 
-def get_gpauth_configs():
-    return gpauth_configs
+def get_gpauth_configs(bot_id=None):
+    state = _get_state(bot_id)
+    return state["gpauth_configs"] if state else {}
 
 
-def get_autowelgps_list():
-    return autowelgps_list
+def get_autowelgps_list(bot_id=None):
+    state = _get_state(bot_id)
+    return state["autowelgps_list"] if state else []
 
 
-def get_gpwel_configs():
-    return gpwel_configs
+def get_gpwel_configs(bot_id=None):
+    state = _get_state(bot_id)
+    return state["gpwel_configs"] if state else {}
 
 
-def get_autorecallgps_list():
-    return autorecallgps_list
+def get_autorecallgps_list(bot_id=None):
+    state = _get_state(bot_id)
+    return state["autorecallgps_list"] if state else []
 
 
-def get_gprecall_configs():
-    return gprecall_configs
+def get_gprecall_configs(bot_id=None):
+    state = _get_state(bot_id)
+    return state["gprecall_configs"] if state else {}
 
 
-def get_fkgps_list():
-    return fkgps_list
+def get_fkgps_list(bot_id=None):
+    state = _get_state(bot_id)
+    return state["fkgps_list"] if state else []
 
 
-def get_gpfk_configs():
-    return gpfk_configs
+def get_gpfk_configs(bot_id=None):
+    state = _get_state(bot_id)
+    return state["gpfk_configs"] if state else {}
 
 
-def get_group_admin_commands():
-    return group_admin_commands
+def get_group_admin_commands(bot_id=None):
+    state = _get_state(bot_id)
+    return state["group_admin_commands"] if state else []
 
 
-def get_bot_admin_commands():
-    return bot_admin_commands
+def get_bot_admin_commands(bot_id=None):
+    state = _get_state(bot_id)
+    return state["bot_admin_commands"] if state else []
 
 
-def get_webui_dir():
-    return webui_dir
+def get_webui_dir(bot_id=None):
+    state = _get_state(bot_id)
+    return state["webui_dir"] if state else None
 
 
-def check_modified():
-    """检查 group.json 是否被外部修改（mtime 变化）"""
+# ===================== 配置修改检测 / 保存 =====================
+def check_modified(bot_id=None):
+    """检查当前账号 group.json 是否被外部修改（mtime 变化）"""
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return False
+    state = _get_state(resolved)
     try:
-        if os.path.exists(_GROUP_FILE):
-            return os.path.getmtime(_GROUP_FILE) > _config_last_modified
+        gfile = _group_file(resolved)
+        if os.path.exists(gfile):
+            return os.path.getmtime(gfile) > state["config_last_modified"]
     except Exception as e:
         logger.error(f"检查配置文件修改状态时出错: {e}")
     return False
 
 
-def _apply_autoreg_cache():
-    global commandshidden, group_admin_commands, bot_admin_commands
-    for key, value in _autoreg_commands.items():
-        if key not in commands_map:
-            commands_map[key] = value
-    for key, value in _autoreg_commandsinfo.items():
-        if key not in _runtime_commandsinfo:
-            _runtime_commandsinfo[key] = value
-    for key, value in _autoreg_commandscategory.items():
-        if key not in _runtime_commandscategory:
-            _runtime_commandscategory[key] = value
-    for cmd in _autoreg_bot_admin:
-        if cmd not in bot_admin_commands:
-            bot_admin_commands.append(cmd)
-    for cmd in _autoreg_group_admin:
-        if cmd not in group_admin_commands:
-            group_admin_commands.append(cmd)
-    for cmd in _autoreg_hidden:
-        if cmd not in commandshidden:
-            commandshidden.append(cmd)
-
-
-def _apply_group_data(group_data):
-    """根据 group.json dict 更新全部运行时派生状态"""
-    global botid, botname, version, listening_qq_list, target_group, commands_map
-    global admin_list, bangroup_list, autosinggps_list, banrepgroup_list
-    global testgp, testmode, commandshidden, onimagehelp
-    global gpauthgroups, gpauthfrequency, gpauthtime, gpauth_configs
-    global autowelgps_list, gpwel_configs, autorecallgps_list, gprecall_configs
-    global fkgps_list, gpfk_configs, group_admin_commands, bot_admin_commands, webui_dir
-    global _send_port, _webhook_port, _LLbot_URL
-    global _runtime_commandsinfo, _runtime_commandscategory
-
-    botid = str(group_data.get("bqq", 0))
-    botname = str(group_data.get("botname", "mjbcore"))
-    version = str(group_data.get("version", "1.0.0"))
-    listening_qq_list = _to_list(group_data.get("listeningqq", ""))
-    target_group = str(group_data.get("group", ""))
-
-    commands_data = group_data.get("commands", {})
-    if isinstance(commands_data, dict):
-        commands_map.clear()
-        commands_map.update(commands_data)
-
-    # 重置 autoreg 临时注册的运行时变量（reload 时清空旧值）
-    _runtime_commandsinfo.clear()
-    _runtime_commandscategory.clear()
-
-    onimagehelp = bool(group_data.get("onimagehelp", True))
-    banrepgroup_list = _to_list(group_data.get("banrepgroup", []))
-    admin_list = _to_list(group_data.get("admin", []))
-    autosinggps_list = _to_list(group_data.get("autosinggps", []))
-    bangroup_list = _to_list(group_data.get("bangroup", []))
-    commandshidden = _to_list(group_data.get("commandshidden", []))
-    testgp = str(group_data.get("testgp", ""))
-    testmode = bool(group_data.get("testmode", False))
-
-    gpauthgroups = _to_list(group_data.get("autoauthgps", []))
-    gpauthfrequency = group_data.get("gpauthfrequency", 3)
-    gpauthtime = group_data.get("gpauthtime", 300)
-    gpauth_configs = group_data.get("gpauth_configs", {})
-
-    autowelgps_list = _to_list(group_data.get("autowelgps", []))
-    gpwel_configs = group_data.get("gpwel_configs", {})
-    autorecallgps_list = _to_list(group_data.get("autorecallgps", []))
-    gprecall_configs = group_data.get("gprecall_configs", {})
-
-    fkgps_list = _to_list(group_data.get("fkgps", []))
-    # 单群屏蔽词配置从模块配置目录读取
-    gpfk_configs = load_module_config("gpfk_configs.json")
-
-    group_admin_commands = _to_list(group_data.get("group_admin_commands", []))
-    bot_admin_commands = _to_list(group_data.get("bot_admin_commands", []))
-
-    # WebUI 目录
-    webui_path = group_data.get("webui_path", None)
-    webui_dir = None
-    if webui_path:
-        if not os.path.isabs(webui_path):
-            webui_dir = os.path.join(_ROOT, webui_path)
-        else:
-            webui_dir = webui_path
-        if not os.path.exists(webui_dir):
-            webui_dir = None
-
-    # Webhook 端口和 HTTP 发送端口（从 group.json 读取）
-    _webhook_port = int(group_data.get("webhook_port", 9762))
-    _send_port = int(group_data.get("send_port", 3002))
-    _LLbot_URL = f"http://127.0.0.1:{_send_port}"
-
-    # 重新应用 autoreg 缓存（热重载后保持模块注册的命令）
-    _apply_autoreg_cache()
-
-
-def load():
-    """首次加载 group.json / config.json"""
-    global _config, _config_config, _config_last_modified
+def save(data=None, bot_id=None):
+    """写回当前账号 group.json"""
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return False
+    state = _get_state(resolved)
     try:
-        if os.path.exists(_GROUP_FILE):
-            with open(_GROUP_FILE, "r", encoding="utf-8") as f:
-                _config = json.load(f)
-            _apply_group_data(_config)
-            _config_last_modified = os.path.getmtime(_GROUP_FILE)
-            logger.info(f"欢迎使用{botname} {version}")
-            logger.info(f"已加载命令配置: {', '.join(commands_map.keys())}")
-            logger.info("已读取本地配置文件，正在部署...")
-            if testmode:
-                logger.info(f"调试模式已开启，仅群{testgp}可触发bot")
-        else:
-            logger.error("未找到 group.json，请先配置")
+        if data is not None:
+            state["config"] = data
+        gfile = _group_file(resolved)
+        os.makedirs(os.path.dirname(gfile), exist_ok=True)
+        with open(gfile, "w", encoding="utf-8") as f:
+            json.dump(state["config"], f, ensure_ascii=False, indent=4)
+        state["config_last_modified"] = os.path.getmtime(gfile)
+        return True
     except Exception as e:
-        logger.error(f"读取配置文件失败: {e}")
+        logger.error(f"保存配置文件失败: {e}")
+        return False
+
+
+# ===================== 加载 / 重载 =====================
+def load():
+    """首次加载：遍历所有账号加载 group.json / config.json"""
+    load_accounts()
+    for bot_id in get_account_list():
+        _load_account(bot_id)
+
+
+def _load_account(bot_id):
+    """加载单个账号的 group.json / config.json 到账号状态"""
+    state = _get_state(bot_id)
+    gfile = _group_file(bot_id)
+    try:
+        if os.path.exists(gfile):
+            with open(gfile, "r", encoding="utf-8") as f:
+                state["config"] = json.load(f)
+            _apply_group_data(state, state["config"])
+            state["config_last_modified"] = os.path.getmtime(gfile)
+            logger.info(f"账号{bot_id} 欢迎使用{state['botname']} {state['version']}")
+            logger.info(f"账号{bot_id} 已加载命令配置: {', '.join(state['commands_map'].keys())}")
+            logger.info(f"账号{bot_id} 已读取本地配置文件，正在部署...")
+            if state["testmode"]:
+                logger.info(f"账号{bot_id} 调试模式已开启，仅群{state['testgp']}可触发bot")
+        else:
+            logger.error(f"账号{bot_id} 未找到 group.json，请先配置: {gfile}")
+    except Exception as e:
+        logger.error(f"账号{bot_id} 读取配置文件失败: {e}")
 
     try:
         if os.path.exists(_CONFIG_FILE):
             with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
-                _config_config = json.load(f)
+                state["config_config"] = json.load(f)
     except Exception as e:
         logger.error(f"读取 config.json 失败: {e}")
 
 
-def reload():
-    """热重载 group.json 并触发模块重载钩子"""
-    global _config, _config_last_modified
-    try:
-        if os.path.exists(_GROUP_FILE):
-            with open(_GROUP_FILE, "r", encoding="utf-8") as f:
-                _config = json.load(f)
-            _apply_group_data(_config)
-            _config_last_modified = os.path.getmtime(_GROUP_FILE)
-            logger.info("配置文件已重载")
-            logger.info(f"机器人名称: {botname} / 内核版本: {version} / 机器人QQ: {botid}")
-            logger.info(f"监听QQ列表: {', '.join(listening_qq_list)}")
-            logger.info(f"管理员列表: {', '.join(admin_list)}")
-            logger.info(f"功能禁用群列表: {', '.join(bangroup_list)}")
+def reload(bot_id=None):
+    """热重载 group.json 并触发模块重载钩子
 
-            # 触发模块重载钩子（如拍砖数据、屏蔽词等）
+    bot_id=None 时默认重载全部账号（保留各账号已有 autoreg 缓存并重放）。
+    """
+    if bot_id is None:
+        target_ids = get_account_list()
+        if not target_ids:
+            default = get_default_bot_id()
+            target_ids = [default] if default else []
+    else:
+        target_ids = [str(bot_id)]
+    if not target_ids:
+        return False
+    results = [_reload_account(bid) for bid in target_ids]
+    return all(results)
+
+
+def _reload_account(bot_id):
+    """重载单个账号配置并触发模块重载钩子（在账号上下文中执行）"""
+    state = _get_state(bot_id)
+    gfile = _group_file(bot_id)
+    try:
+        if not os.path.exists(gfile):
+            logger.error(f"账号{bot_id} 未找到 group.json，无法重载")
+            return False
+        with open(gfile, "r", encoding="utf-8") as f:
+            state["config"] = json.load(f)
+        _apply_group_data(state, state["config"])
+        state["config_last_modified"] = os.path.getmtime(gfile)
+        logger.info(f"账号{bot_id} 配置文件已重载")
+        logger.info(
+            f"账号{bot_id} 机器人名称: {state['botname']} / 内核版本: {state['version']} / 机器人QQ: {state['botid']}"
+        )
+        logger.info(f"账号{bot_id} 监听QQ列表: {', '.join(state['listening_qq_list'])}")
+        logger.info(f"账号{bot_id} 管理员列表: {', '.join(state['admin_list'])}")
+        logger.info(f"账号{bot_id} 功能禁用群列表: {', '.join(state['bangroup_list'])}")
+
+        # 设置账号上下文执行模块重载钩子与主群提示（send 无参调用路由到该账号）
+        prev = get_current_bot_id()
+        set_current_bot_id(bot_id)
+        try:
             for hook in list(_reload_hooks):
                 try:
                     hook()
@@ -385,17 +601,190 @@ def reload():
             # 在主群发送重载提示（延迟导入 send 避免循环依赖）
             try:
                 from bin import send
-                if target_group and target_group != "0":
-                    send.group(target_group, "配置文件已自动重载")
+                if state["target_group"] and state["target_group"] != "0":
+                    send.group(state["target_group"], "配置文件已自动重载")
             except Exception as e:
                 logger.error(f"发送重载提示失败: {e}")
-            return True
+        finally:
+            if prev is None:
+                clear_current_bot_id()
+            else:
+                set_current_bot_id(prev)
+        return True
     except Exception as e:
         logger.error(f"重载配置文件失败: {e}")
         return False
 
 
-def apply_module_autoreg(autoreg, module_name=""):
+# ===================== 模块重载钩子（全局） =====================
+def register_reload_hook(fn):
+    """模块注册重载钩子，reload() 时会调用以重载模块自身数据"""
+    if fn not in _reload_hooks:
+        _reload_hooks.append(fn)
+
+
+# ===================== autoreg 缓存（按账号状态） =====================
+def _apply_autoreg_cache(state):
+    """将账号状态中的 autoreg 缓存重新应用到运行时变量（热重载后保持模块注册的命令）"""
+    for key, value in state["autoreg_commands"].items():
+        if key not in state["commands_map"]:
+            state["commands_map"][key] = value
+    for key, value in state["autoreg_commandsinfo"].items():
+        if key not in state["runtime_commandsinfo"]:
+            state["runtime_commandsinfo"][key] = value
+    for key, value in state["autoreg_commandscategory"].items():
+        if key not in state["runtime_commandscategory"]:
+            state["runtime_commandscategory"][key] = value
+    for cmd in state["autoreg_bot_admin"]:
+        if cmd not in state["bot_admin_commands"]:
+            state["bot_admin_commands"].append(cmd)
+    for cmd in state["autoreg_group_admin"]:
+        if cmd not in state["group_admin_commands"]:
+            state["group_admin_commands"].append(cmd)
+    for cmd in state["autoreg_hidden"]:
+        if cmd not in state["commandshidden"]:
+            state["commandshidden"].append(cmd)
+
+
+def _apply_group_data(state, group_data):
+    """根据当前账号 group.json dict 更新该账号全部运行时派生状态"""
+    state["botid"] = str(group_data.get("bqq", 0))
+    state["botname"] = str(group_data.get("botname", "mjbcore"))
+    state["version"] = str(group_data.get("version", "1.0.0"))
+    state["listening_qq_list"] = _to_list(group_data.get("listeningqq", ""))
+    state["target_group"] = str(group_data.get("group", ""))
+
+    commands_data = group_data.get("commands", {})
+    if isinstance(commands_data, dict):
+        state["commands_map"].clear()
+        state["commands_map"].update(commands_data)
+
+    # 重置 autoreg 临时注册的运行时变量（reload 时清空旧值，稍后由缓存重放）
+    state["runtime_commandsinfo"].clear()
+    state["runtime_commandscategory"].clear()
+
+    state["onimagehelp"] = bool(group_data.get("onimagehelp", True))
+    state["banrepgroup_list"] = _to_list(group_data.get("banrepgroup", []))
+    state["admin_list"] = _to_list(group_data.get("admin", []))
+    state["autosinggps_list"] = _to_list(group_data.get("autosinggps", []))
+    state["bangroup_list"] = _to_list(group_data.get("bangroup", []))
+    state["commandshidden"] = _to_list(group_data.get("commandshidden", []))
+    state["testgp"] = str(group_data.get("testgp", ""))
+    state["testmode"] = bool(group_data.get("testmode", False))
+
+    state["gpauthgroups"] = _to_list(group_data.get("autoauthgps", []))
+    state["gpauthfrequency"] = group_data.get("gpauthfrequency", 3)
+    state["gpauthtime"] = group_data.get("gpauthtime", 300)
+    state["gpauth_configs"] = group_data.get("gpauth_configs", {})
+
+    state["autowelgps_list"] = _to_list(group_data.get("autowelgps", []))
+    state["gpwel_configs"] = group_data.get("gpwel_configs", {})
+    state["autorecallgps_list"] = _to_list(group_data.get("autorecallgps", []))
+    state["gprecall_configs"] = group_data.get("gprecall_configs", {})
+
+    state["fkgps_list"] = _to_list(group_data.get("fkgps", []))
+    # 单群屏蔽词配置从当前账号模块配置目录读取
+    state["gpfk_configs"] = load_module_config("gpfk_configs.json", bot_id=state["botid"])
+
+    state["group_admin_commands"] = _to_list(group_data.get("group_admin_commands", []))
+    state["bot_admin_commands"] = _to_list(group_data.get("bot_admin_commands", []))
+
+    # WebUI 目录
+    webui_path = group_data.get("webui_path", None)
+    state["webui_dir"] = None
+    if webui_path:
+        if not os.path.isabs(webui_path):
+            state["webui_dir"] = os.path.join(_ROOT, webui_path)
+        else:
+            state["webui_dir"] = webui_path
+        if not os.path.exists(state["webui_dir"]):
+            state["webui_dir"] = None
+
+    # Webhook 端口和 HTTP 发送端口：account.json 优先、回退 group.json、再回退默认值
+    webhook_port = None
+    send_port = None
+    acc = get_accounts().get(state["botid"], {})
+    if isinstance(acc, dict):
+        webhook_port = acc.get("webhook_port")
+        send_port = acc.get("send_port")
+    if webhook_port is None:
+        webhook_port = group_data.get("webhook_port", _DEFAULT_WEBHOOK_PORT)
+    if send_port is None:
+        send_port = group_data.get("send_port", _DEFAULT_SEND_PORT)
+    state["webhook_port"] = int(webhook_port)
+    state["send_port"] = int(send_port)
+    state["LLbot_URL"] = f"http://127.0.0.1:{state['send_port']}"
+
+    # 重新应用 autoreg 缓存（热重载后保持模块注册的命令）
+    _apply_autoreg_cache(state)
+
+
+def _apply_module_autoreg_to(autoreg, bot_id):
+    """将模块 autoreg 合并到指定账号的运行时状态，返回合并项描述列表"""
+    state = _get_state(bot_id)
+    merged_keys = []
+
+    # commands 合并到运行时 commands_map 并写入缓存（不写 _config）
+    autoreg_commands = autoreg.get("commands", {})
+    if isinstance(autoreg_commands, dict):
+        for key, value in autoreg_commands.items():
+            state["autoreg_commands"][key] = value
+            if key not in state["commands_map"]:
+                state["commands_map"][key] = value
+        merged_keys.append(f"commands={list(autoreg_commands.keys())}")
+
+    # commandsinfo 合并到运行时变量并写入缓存（group.json 中已有的项优先）
+    autoreg_info = autoreg.get("commandsinfo", {})
+    if isinstance(autoreg_info, dict):
+        for key, value in autoreg_info.items():
+            state["autoreg_commandsinfo"][key] = value
+            if key not in state["runtime_commandsinfo"]:
+                state["runtime_commandsinfo"][key] = value
+        merged_keys.append(f"commandsinfo={len(autoreg_info)}项")
+
+    # commandscategory 合并到运行时变量并写入缓存（group.json 中已有的项优先）
+    autoreg_cat = autoreg.get("commandscategory", {})
+    if isinstance(autoreg_cat, dict):
+        for key, value in autoreg_cat.items():
+            state["autoreg_commandscategory"][key] = value
+            if key not in state["runtime_commandscategory"]:
+                state["runtime_commandscategory"][key] = value
+        merged_keys.append(f"commandscategory={len(autoreg_cat)}项")
+
+    # bot_admin_commands 合并到运行时变量并写入缓存（不写 _config）
+    autoreg_bot_admin = _to_list(autoreg.get("bot_admin_commands", []))
+    if autoreg_bot_admin:
+        for cmd in autoreg_bot_admin:
+            if cmd not in state["autoreg_bot_admin"]:
+                state["autoreg_bot_admin"].append(cmd)
+            if cmd not in state["bot_admin_commands"]:
+                state["bot_admin_commands"].append(cmd)
+        merged_keys.append(f"bot_admin_commands={autoreg_bot_admin}")
+
+    # group_admin_commands 合并到运行时变量并写入缓存（不写 _config）
+    autoreg_group_admin = _to_list(autoreg.get("group_admin_commands", []))
+    if autoreg_group_admin:
+        for cmd in autoreg_group_admin:
+            if cmd not in state["autoreg_group_admin"]:
+                state["autoreg_group_admin"].append(cmd)
+            if cmd not in state["group_admin_commands"]:
+                state["group_admin_commands"].append(cmd)
+        merged_keys.append(f"group_admin_commands={autoreg_group_admin}")
+
+    # commandshidden 合并到运行时变量并写入缓存（不写 _config）
+    autoreg_hidden = _to_list(autoreg.get("commandshidden", []))
+    if autoreg_hidden:
+        for cmd in autoreg_hidden:
+            if cmd not in state["autoreg_hidden"]:
+                state["autoreg_hidden"].append(cmd)
+            if cmd not in state["commandshidden"]:
+                state["commandshidden"].append(cmd)
+        merged_keys.append(f"commandshidden={autoreg_hidden}")
+
+    return merged_keys
+
+
+def apply_module_autoreg(autoreg, module_name="", bot_id=None):
     """将模块 modcfg().autoreg 中的命令注册表合并到运行时状态（不写入配置文件）
 
     autoreg 作为模块自带的"默认注册表"，仅在运行时变量中临时注册，
@@ -412,98 +801,34 @@ def apply_module_autoreg(autoreg, module_name=""):
     Args:
         autoreg: dict，模块 modcfg() 返回的 autoreg 字段
         module_name: 模块名（仅用于日志）
+        bot_id: 目标账号；None 表示应用到所有账号
     """
-    global commandshidden, group_admin_commands, bot_admin_commands
-    global _runtime_commandsinfo, _runtime_commandscategory
-    global _autoreg_commands, _autoreg_commandsinfo, _autoreg_commandscategory
-    global _autoreg_bot_admin, _autoreg_group_admin, _autoreg_hidden
-
     if not isinstance(autoreg, dict):
+        return
+    if bot_id is None:
+        target_ids = get_account_list()
+        if not target_ids:
+            default = get_default_bot_id()
+            target_ids = [default] if default else []
+    else:
+        target_ids = [str(bot_id)]
+    if not target_ids:
         return
 
     prefix = f"[模块{module_name}]" if module_name else "[autoreg]"
-    merged_keys = []
-
-    # commands 合并到运行时 commands_map 并写入缓存（不写 _config）
-    autoreg_commands = autoreg.get("commands", {})
-    if isinstance(autoreg_commands, dict):
-        for key, value in autoreg_commands.items():
-            _autoreg_commands[key] = value
-            if key not in commands_map:
-                commands_map[key] = value
-        merged_keys.append(f"commands={list(autoreg_commands.keys())}")
-
-    # commandsinfo 合并到运行时变量并写入缓存（group.json 中已有的项优先）
-    autoreg_info = autoreg.get("commandsinfo", {})
-    if isinstance(autoreg_info, dict):
-        for key, value in autoreg_info.items():
-            _autoreg_commandsinfo[key] = value
-            if key not in _runtime_commandsinfo:
-                _runtime_commandsinfo[key] = value
-        merged_keys.append(f"commandsinfo={len(autoreg_info)}项")
-
-    # commandscategory 合并到运行时变量并写入缓存（group.json 中已有的项优先）
-    autoreg_cat = autoreg.get("commandscategory", {})
-    if isinstance(autoreg_cat, dict):
-        for key, value in autoreg_cat.items():
-            _autoreg_commandscategory[key] = value
-            if key not in _runtime_commandscategory:
-                _runtime_commandscategory[key] = value
-        merged_keys.append(f"commandscategory={len(autoreg_cat)}项")
-
-    # bot_admin_commands 合并到运行时变量并写入缓存（不写 _config）
-    autoreg_bot_admin = _to_list(autoreg.get("bot_admin_commands", []))
-    if autoreg_bot_admin:
-        for cmd in autoreg_bot_admin:
-            if cmd not in _autoreg_bot_admin:
-                _autoreg_bot_admin.append(cmd)
-            if cmd not in bot_admin_commands:
-                bot_admin_commands.append(cmd)
-        merged_keys.append(f"bot_admin_commands={autoreg_bot_admin}")
-
-    # group_admin_commands 合并到运行时变量并写入缓存（不写 _config）
-    autoreg_group_admin = _to_list(autoreg.get("group_admin_commands", []))
-    if autoreg_group_admin:
-        for cmd in autoreg_group_admin:
-            if cmd not in _autoreg_group_admin:
-                _autoreg_group_admin.append(cmd)
-            if cmd not in group_admin_commands:
-                group_admin_commands.append(cmd)
-        merged_keys.append(f"group_admin_commands={autoreg_group_admin}")
-
-    # commandshidden 合并到运行时变量并写入缓存（不写 _config）
-    autoreg_hidden = _to_list(autoreg.get("commandshidden", []))
-    if autoreg_hidden:
-        for cmd in autoreg_hidden:
-            if cmd not in _autoreg_hidden:
-                _autoreg_hidden.append(cmd)
-            if cmd not in commandshidden:
-                commandshidden.append(cmd)
-        merged_keys.append(f"commandshidden={autoreg_hidden}")
-
-    if merged_keys:
-        logger.info(f"{prefix} 已自动注册: {', '.join(merged_keys)}")
+    for bid in target_ids:
+        merged_keys = _apply_module_autoreg_to(autoreg, bid)
+        if merged_keys:
+            logger.info(f"账号{bid} {prefix} 已自动注册: {', '.join(merged_keys)}")
 
 
-def save(data=None):
-    """写回 group.json"""
-    global _config, _config_last_modified
-    try:
-        if data is not None:
-            _config = data
-        with open(_GROUP_FILE, "w", encoding="utf-8") as f:
-            json.dump(_config, f, ensure_ascii=False, indent=4)
-        _config_last_modified = os.path.getmtime(_GROUP_FILE)
-        return True
-    except Exception as e:
-        logger.error(f"保存配置文件失败: {e}")
-        return False
-
-
-# ---- 模块配置（modules/config/）----
-def load_module_config(name):
-    """从 modules/config/ 读取模块配置；为兼容迁移，回退到根目录"""
-    paths = [os.path.join(_MODULES_CONFIG_DIR, name), os.path.join(_ROOT, name)]
+# ===================== 模块配置（config/<bot_id>/modcfg/） =====================
+def load_module_config(name, bot_id=None):
+    """从 config/<bot_id>/modcfg/ 读取模块配置；兼容回退：文件不存在时返回 {}"""
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return {}
+    paths = [os.path.join(_modcfg_dir(resolved), name), _core_config_file(resolved, name)]
     for path in paths:
         if os.path.exists(path):
             try:
@@ -515,11 +840,15 @@ def load_module_config(name):
     return {}
 
 
-def save_module_config(name, data):
-    """写入模块配置到 modules/config/"""
+def save_module_config(name, data, bot_id=None):
+    """写入模块配置到 config/<bot_id>/modcfg/"""
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return False
     try:
-        os.makedirs(_MODULES_CONFIG_DIR, exist_ok=True)
-        path = os.path.join(_MODULES_CONFIG_DIR, name)
+        mdir = _modcfg_dir(resolved)
+        os.makedirs(mdir, exist_ok=True)
+        path = os.path.join(mdir, name)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
         return True
@@ -528,21 +857,30 @@ def save_module_config(name, data):
         return False
 
 
-# ---- 核心配置（根目录）----
-def load_banuser():
+# ===================== 核心配置（config/<bot_id>/） =====================
+def load_banuser(bot_id=None):
     """读取黑名单 banuser.json -> {"banned_users": {...}}"""
-    if os.path.exists(_BANUSER_FILE):
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return {}
+    path = _core_config_file(resolved, "banuser.json")
+    if os.path.exists(path):
         try:
-            with open(_BANUSER_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f).get("banned_users", {})
         except Exception as e:
             logger.error(f"读取banuser.json失败: {e}")
     return {}
 
 
-def save_banuser(banned_users):
+def save_banuser(banned_users, bot_id=None):
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return False
     try:
-        with open(_BANUSER_FILE, "w", encoding="utf-8") as f:
+        path = _core_config_file(resolved, "banuser.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump({"banned_users": banned_users}, f, ensure_ascii=False, indent=4)
         return True
     except Exception as e:
@@ -550,19 +888,28 @@ def save_banuser(banned_users):
         return False
 
 
-def load_gpevent():
-    if os.path.exists(_GPEVENT_FILE):
+def load_gpevent(bot_id=None):
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return {}
+    path = _core_config_file(resolved, "gpevent.json")
+    if os.path.exists(path):
         try:
-            with open(_GPEVENT_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             logger.error(f"读取gpevent.json失败: {e}")
     return {}
 
 
-def save_gpevent(data):
+def save_gpevent(data, bot_id=None):
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return False
     try:
-        with open(_GPEVENT_FILE, "w", encoding="utf-8") as f:
+        path = _core_config_file(resolved, "gpevent.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
         return True
     except Exception as e:
@@ -570,19 +917,28 @@ def save_gpevent(data):
         return False
 
 
-def load_gpauths():
-    if os.path.exists(_GPAUTHS_FILE):
+def load_gpauths(bot_id=None):
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return {}
+    path = _core_config_file(resolved, "gpauths.json")
+    if os.path.exists(path):
         try:
-            with open(_GPAUTHS_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             logger.error(f"读取gpauths.json失败: {e}")
     return {}
 
 
-def save_gpauths(data):
+def save_gpauths(data, bot_id=None):
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return False
     try:
-        with open(_GPAUTHS_FILE, "w", encoding="utf-8") as f:
+        path = _core_config_file(resolved, "gpauths.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
         return True
     except Exception as e:

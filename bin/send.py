@@ -5,26 +5,37 @@ import requests
 from bin import logger, mjbconfig
 
 
-def _url(action):
-    return f"{mjbconfig.get_LLbot_url()}/{action}"
+def _url(action, bot_id=None, group_id=None):
+    """构造 LLbotQQ API 地址
+
+    bot_id 为 None 且当前线程无账号上下文时，根据 group_id 查找关联账号
+    （用于后台线程/定时任务中模块无上下文调用 send.group 的回退场景）
+    """
+    if bot_id is None and group_id is not None:
+        if mjbconfig.get_current_bot_id() is None:
+            mapped = mjbconfig.get_bot_id_by_group(str(group_id))
+            if mapped:
+                bot_id = mapped
+    return f"{mjbconfig.get_LLbot_url(bot_id)}/{action}"
 
 
-def api(action, **payload):
+def api(action, bot_id=None, **payload):
     """通用 LLbotQQ HTTP API 调用"""
     try:
-        response = requests.post(_url(action), json=payload, timeout=15)
+        group_id = payload.get("group_id")
+        response = requests.post(_url(action, bot_id, group_id), json=payload, timeout=15)
         return response.json()
     except Exception as e:
         logger.error(f"调用 API {action} 失败: {e}")
         return {"status": "error", "message": str(e)}
 
 
-def group(group_id, message):
+def group(group_id, message, bot_id=None):
     """发送群文本消息"""
     try:
         if group_id == 0:
             return
-        requests.post(_url("send_group_msg"), json={
+        requests.post(_url("send_group_msg", bot_id, group_id), json={
             "group_id": group_id,
             "message": [{"type": "text", "data": {"text": message}}],
         }, timeout=15)
@@ -32,7 +43,7 @@ def group(group_id, message):
         logger.error(f"发送群消息时出错: {e}")
 
 
-def group_at(group_id, qq_number, text_message=""):
+def group_at(group_id, qq_number, text_message="", bot_id=None):
     """发送群聊 @ 消息"""
     try:
         if group_id == 0:
@@ -40,7 +51,7 @@ def group_at(group_id, qq_number, text_message=""):
         message_content = [{"type": "at", "data": {"qq": str(qq_number)}}]
         if text_message:
             message_content.append({"type": "text", "data": {"text": text_message}})
-        requests.post(_url("send_group_msg"), json={
+        requests.post(_url("send_group_msg", bot_id, group_id), json={
             "group_id": group_id,
             "message": message_content,
         }, timeout=15)
@@ -48,7 +59,7 @@ def group_at(group_id, qq_number, text_message=""):
         logger.error(f"发送群@消息时出错: {e}")
 
 
-def group_reply(group_id, user_id, message_id, content):
+def group_reply(group_id, user_id, message_id, content, bot_id=None):
     """发送引用消息回复"""
     try:
         message_content = [
@@ -56,7 +67,7 @@ def group_reply(group_id, user_id, message_id, content):
             {"type": "at", "data": {"qq": int(user_id)}},
             {"type": "text", "data": {"text": f" {content}"}},
         ]
-        requests.post(_url("send_group_msg"), json={
+        requests.post(_url("send_group_msg", bot_id, group_id), json={
             "group_id": int(group_id),
             "message": message_content,
         }, timeout=15)
@@ -67,7 +78,7 @@ def group_reply(group_id, user_id, message_id, content):
         return False
 
 
-def group_image(group_id, image_path):
+def group_image(group_id, image_path, bot_id=None):
     """发送群聊图片消息"""
     try:
         if not group_id or group_id == 0:
@@ -85,7 +96,7 @@ def group_image(group_id, image_path):
             "group_id": int(group_id) if isinstance(group_id, str) else group_id,
             "message": [{"type": "image", "data": {"file": abs_image_path}}],
         }
-        response = requests.post(_url("send_group_msg"), json=payload, timeout=15)
+        response = requests.post(_url("send_group_msg", bot_id, group_id), json=payload, timeout=15)
         response.raise_for_status()
         logger.debug(f"图片消息发送成功，响应: {response.json()}")
         return True
@@ -103,14 +114,14 @@ def group_image(group_id, image_path):
         return False
 
 
-def private(user_id, content):
+def private(user_id, content, bot_id=None):
     """发送私聊文本消息"""
     try:
         payload = {
             "user_id": int(user_id),
             "message": [{"type": "text", "data": {"text": content}}],
         }
-        response = requests.post(_url("send_private_msg"), json=payload, timeout=15)
+        response = requests.post(_url("send_private_msg", bot_id), json=payload, timeout=15)
         response.raise_for_status()
         logger.info(f"私聊消息发送成功: 用户{user_id}")
         return True
@@ -119,7 +130,7 @@ def private(user_id, content):
         return False
 
 
-def send_group_forward_msg(group_id, messages, fake_qq=None, fake_name=None):
+def send_group_forward_msg(group_id, messages, fake_qq=None, fake_name=None, bot_id=None):
     """发送群聊合并转发消息
 
     Args:
@@ -140,7 +151,7 @@ def send_group_forward_msg(group_id, messages, fake_qq=None, fake_name=None):
             node_data["data"]["uin"] = fake_qq
         if fake_name:
             node_data["data"]["name"] = fake_name
-        response = requests.post(_url("send_group_forward_msg"), json={
+        response = requests.post(_url("send_group_forward_msg", bot_id, group_id), json={
             "group_id": group_id,
             "messages": [node_data],
         }, timeout=15)
@@ -150,7 +161,7 @@ def send_group_forward_msg(group_id, messages, fake_qq=None, fake_name=None):
         return {"status": "error", "message": str(e)}
 
 
-def send_group_file(group_id, file_path, file_name=None, folder_id=None):
+def send_group_file(group_id, file_path, file_name=None, folder_id=None, bot_id=None):
     """发送群文件
 
     Returns:
@@ -165,7 +176,7 @@ def send_group_file(group_id, file_path, file_name=None, folder_id=None):
         payload = {"group_id": int(group_id), "file": file_path, "name": file_name}
         if folder_id:
             payload["folder_id"] = folder_id
-        response = requests.post(_url("upload_group_file"), json=payload, timeout=30)
+        response = requests.post(_url("upload_group_file", bot_id, group_id), json=payload, timeout=30)
         if response.status_code == 200:
             result = response.json()
             if result.get("status") == "ok":
@@ -182,11 +193,11 @@ def send_group_file(group_id, file_path, file_name=None, folder_id=None):
 
 
 # ---- LLbotQQ API 封装 ----
-def get_group_member_role(group_id, user_id):
+def get_group_member_role(group_id, user_id, bot_id=None):
     """获取群成员身份：owner/admin/member/unknown"""
     try:
         payload = {"group_id": int(group_id), "user_id": int(user_id), "no_cache": False}
-        response = requests.post(_url("get_group_member_info"), json=payload, timeout=10)
+        response = requests.post(_url("get_group_member_info", bot_id, group_id), json=payload, timeout=10)
         if response.status_code == 200:
             data = response.json()
             if data.get("status") == "ok" and "data" in data:
@@ -197,10 +208,10 @@ def get_group_member_role(group_id, user_id):
         return "unknown"
 
 
-def get_group_member_info(group_id, user_id):
+def get_group_member_info(group_id, user_id, bot_id=None):
     """获取群成员信息（完整 dict）"""
     try:
-        response = requests.post(_url("get_group_member_info"), json={
+        response = requests.post(_url("get_group_member_info", bot_id, group_id), json={
             "group_id": int(group_id), "user_id": int(user_id),
         }, timeout=10)
         if response.status_code == 200:
@@ -213,10 +224,10 @@ def get_group_member_info(group_id, user_id):
         return {}
 
 
-def get_group_member_list(group_id):
+def get_group_member_list(group_id, bot_id=None):
     """获取群成员列表"""
     try:
-        response = requests.post(_url("get_group_member_list"), json={
+        response = requests.post(_url("get_group_member_list", bot_id, group_id), json={
             "group_id": group_id,
         }, timeout=10)
         result = response.json()
@@ -228,10 +239,10 @@ def get_group_member_list(group_id):
         return []
 
 
-def get_stranger_info(user_id):
+def get_stranger_info(user_id, bot_id=None):
     """获取用户信息"""
     try:
-        response = requests.post(_url("get_stranger_info"), json={
+        response = requests.post(_url("get_stranger_info", bot_id), json={
             "user_id": user_id,
         }, timeout=10)
         result = response.json()
@@ -243,20 +254,20 @@ def get_stranger_info(user_id):
         return {}
 
 
-def delete_msg(message_id):
+def delete_msg(message_id, bot_id=None):
     """撤回消息"""
     try:
-        requests.post(_url("delete_msg"), json={"message_id": int(message_id)}, timeout=5)
+        requests.post(_url("delete_msg", bot_id), json={"message_id": int(message_id)}, timeout=5)
         return True
     except Exception as e:
         logger.error(f"撤回消息失败: {e}")
         return False
 
 
-def set_group_kick(group_id, user_id, reject_add_request=False):
+def set_group_kick(group_id, user_id, reject_add_request=False, bot_id=None):
     """踢出群成员"""
     try:
-        requests.post(_url("set_group_kick"), json={
+        requests.post(_url("set_group_kick", bot_id, group_id), json={
             "group_id": int(group_id), "user_id": int(user_id),
             "reject_add_request": reject_add_request,
         }, timeout=5)
@@ -267,10 +278,10 @@ def set_group_kick(group_id, user_id, reject_add_request=False):
         return False
 
 
-def set_group_ban(group_id, user_id, duration=0):
+def set_group_ban(group_id, user_id, duration=0, bot_id=None):
     """禁言成员（duration 秒，0 表示解除）"""
     try:
-        requests.post(_url("set_group_ban"), json={
+        requests.post(_url("set_group_ban", bot_id, group_id), json={
             "group_id": int(group_id), "user_id": int(user_id),
             "duration": int(duration),
         }, timeout=5)
@@ -280,38 +291,38 @@ def set_group_ban(group_id, user_id, duration=0):
         return False
 
 
-def send_like(user_id, times=10):
+def send_like(user_id, times=10, bot_id=None):
     """点赞"""
     try:
-        return api("send_like", user_id=int(user_id), times=times)
+        return api("send_like", user_id=int(user_id), times=times, bot_id=bot_id)
     except Exception as e:
         logger.error(f"点赞失败: {e}")
         return {"status": "error", "message": str(e)}
 
 
-def send_poke(group_id, user_id):
+def send_poke(group_id, user_id, bot_id=None):
     """戳一戳"""
     try:
-        return api("group_poke", group_id=int(group_id), user_id=int(user_id))
+        return api("group_poke", bot_id=bot_id, group_id=int(group_id), user_id=int(user_id))
     except Exception as e:
         logger.error(f"戳一戳失败: {e}")
         return {"status": "error", "message": str(e)}
 
 
-def set_group_special_title(group_id, user_id, special_title=""):
+def set_group_special_title(group_id, user_id, special_title="", bot_id=None):
     """设置群成员专属头衔（special_title 为空字符串表示去掉群头衔）"""
     try:
         return api("set_group_special_title", group_id=int(group_id),
-                   user_id=int(user_id), special_title=special_title)
+                   user_id=int(user_id), special_title=special_title, bot_id=bot_id)
     except Exception as e:
         logger.error(f"设置群头衔失败: {e}")
         return {"status": "error", "message": str(e)}
 
 
-def set_essence_msg(message_id):
+def set_essence_msg(message_id, bot_id=None):
     """设置群精华消息"""
     try:
-        return api("set_essence_msg", message_id=int(message_id))
+        return api("set_essence_msg", message_id=int(message_id), bot_id=bot_id)
     except Exception as e:
         logger.error(f"设置群精华消息失败: {e}")
         return {"status": "error", "message": str(e)}

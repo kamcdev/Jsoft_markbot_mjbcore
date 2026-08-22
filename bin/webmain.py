@@ -175,8 +175,39 @@ def _create_app():
 
             client_ip = getattr(request, "client_real_ip", request.remote_addr)
 
-            # 获取心跳信息（带 5 秒超时检测）
-            heartbeat_info = message.get_heartbeat_info()
+            # 获取多账号心跳信息（带 5 秒超时检测）
+            all_heartbeats = message.get_all_heartbeat_info()
+            # 聚合：正常数 / 异常数（None 键视为无账号旧场景，单独计数）
+            accounts_status = {}
+            online_count = 0
+            offline_count = 0
+            for bid, info in all_heartbeats.items():
+                key = bid if bid is not None else "default"
+                is_online = bool(info.get("online", False))
+                accounts_status[key] = {
+                    "online": is_online,
+                    "interval": info.get("interval", 0),
+                    "timestamp": info.get("timestamp", 0),
+                }
+                if is_online:
+                    online_count += 1
+                else:
+                    offline_count += 1
+            total_count = online_count + offline_count
+            # 兼容旧字段 heartbeat（默认账号）
+            default_heartbeat = message.get_heartbeat_info()
+            # 多账号总览字段
+            heartbeat_summary = {
+                "online": online_count > 0 and offline_count == 0,
+                "online_count": online_count,
+                "offline_count": offline_count,
+                "total_count": total_count,
+                "accounts": accounts_status,
+                # 兼容旧字段
+                "interval": default_heartbeat.get("interval", 0),
+                "timestamp": default_heartbeat.get("timestamp", 0),
+                "raw_status": default_heartbeat.get("raw_status", {}),
+            }
 
             status_data = {
                 "bot_status": "running",
@@ -188,7 +219,7 @@ def _create_app():
                 "bot_name": mjbconfig.get_botname(),
                 "version": mjbconfig.get_version(),
                 "client_ip": client_ip,
-                "heartbeat": heartbeat_info,
+                "heartbeat": heartbeat_summary,
                 "background_tasks": worker.get_status(),
             }
             return jsonify({"success": True, "data": status_data})
