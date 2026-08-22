@@ -955,10 +955,11 @@ def cmd_autogpauth(group_id, user_id, config_data, *args):
                 config_data["autoauthgps"] = autoauthgps
                 mjbconfig.save(config_data)
                 mjbconfig.reload()
-                authusers = mjbconfig.load_gpauths()
+                gpauths_data = mjbconfig.load_gpauths()
+                authusers = gpauths_data.get('authusers', {}) if isinstance(gpauths_data, dict) else {}
                 if str(group_id) in authusers:
                     del authusers[str(group_id)]
-                    mjbconfig.save_gpauths(authusers)
+                    mjbconfig.save_gpauths({"authusers": authusers})
                 message = "群验证功能已关闭"
             else:
                 message = "群验证功能已经是关闭状态"
@@ -1088,13 +1089,14 @@ def cmd_setauthok(group_id, user_id, config_data, *args):
         return "无效的QQ号格式"
 
     group_id_str = str(group_id)
-    authusers = mjbconfig.load_gpauths()
+    gpauths_data = mjbconfig.load_gpauths()
+    authusers = gpauths_data.get('authusers', {}) if isinstance(gpauths_data, dict) else {}
     if group_id_str not in authusers or target_qq not in authusers[group_id_str]:
         send.group(group_id, f"用户{target_qq}当前不在验证列表中，无需设置通过")
         return "用户不在验证列表中"
 
     del authusers[group_id_str][target_qq]
-    mjbconfig.save_gpauths(authusers)
+    mjbconfig.save_gpauths({"authusers": authusers})
 
     message = f"已将用户{target_qq}设置为验证通过"
     send.group(group_id, message)
