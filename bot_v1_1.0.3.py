@@ -23,8 +23,6 @@ def init():
     """初始化内核：加载配置并打印基础信息，同时注册退出钩子。"""
     mjbconfig.load()
 
-    botid = mjbconfig.get_botid()
-    botname = mjbconfig.get_botname()
     version = mjbconfig.get_version()
 
     mjbcoretitle = r"""
@@ -39,7 +37,13 @@ def init():
     print(mjbcoretitle)
     logger.info("=" * 50)
     logger.info(f"mjbcore 内核启动 | 内核版本: {version}")
-    logger.info(f"机器人QQ: {botid} | 名称: {botname}")
+    accounts = mjbconfig.get_account_list()
+    if accounts:
+        logger.info(f"已加载账号: {', '.join(accounts)}")
+        for botid in accounts:
+            logger.info(f"机器人QQ: {botid} | 名称: {mjbconfig.get_botname(botid)}")
+    else:
+        logger.info(f"机器人QQ: {mjbconfig.get_botid()} | 名称: {mjbconfig.get_botname()}")
     logger.info("=" * 50)
 
     _register_exit_hooks()
@@ -172,17 +176,18 @@ def load_modules():
 
         loaded += 1
 
-    # 命令功能函数校验：检查 commands_map 中每条命令的函数是否已注册
-    commands_map = mjbconfig.get_commands_map()
+    # 命令功能函数校验：检查各账号 commands_map 中每条命令的函数是否已注册
     registered_funcs = mjbc.get_command_functions()
-    invalid_triggers = []
-    for trigger, func_name in list(commands_map.items()):
-        if func_name not in registered_funcs:
-            logger.warning(f"命令 '{trigger}' 指向的功能函数 '{func_name}' 未提供，已移除该命令")
-            _selfcheck_failures.append(f"命令{trigger}指向的功能函数{func_name}未提供")
-            invalid_triggers.append(trigger)
-    for trigger in invalid_triggers:
-        del commands_map[trigger]
+    for bid in mjbconfig.get_account_list():
+        commands_map = mjbconfig.get_commands_map(bid)
+        invalid_triggers = []
+        for trigger, func_name in list(commands_map.items()):
+            if func_name not in registered_funcs:
+                logger.warning(f"账号{bid} 命令 '{trigger}' 指向的功能函数 '{func_name}' 未提供，已移除该命令")
+                _selfcheck_failures.append(f"账号{bid}命令{trigger}指向的功能函数{func_name}未提供")
+                invalid_triggers.append(trigger)
+        for trigger in invalid_triggers:
+            del commands_map[trigger]
 
     logger.info(f"模块加载完成: 成功 {loaded} 个, 失败 {failed} 个")
 
@@ -199,6 +204,10 @@ def cleanup(*_args):
         worker.shutdown(wait=False)
     except Exception:
         logger.error(f"停止线程池失败:\n{traceback.format_exc()}")
+    try:
+        socket.stop()
+    except Exception:
+        logger.error(f"停止 Webhook 服务失败:\n{traceback.format_exc()}")
     try:
         mjbconfig.save()
     except Exception:
@@ -272,11 +281,11 @@ def _register_exit_hooks():
 
 
 def start():
-    """启动 WebUI（daemon 线程）与 Webhook 服务（主线程阻塞）。"""
+    """启动 WebUI（daemon 线程）与 Webhook 服务（socket.wait 阻塞主线程）。"""
     webmain.start_webui_thread()
     logger.info("WebUI 服务已启动（daemon 线程）")
 
-    # 启动自检通知（向主群发送连接/自检提示，与 1.0.2 行为一致）
+    # 启动自检通知（向各账号主群发送连接/自检提示，与 1.0.2 行为一致）
     _send_startup_notice()
 
     # 启用错误转发到主群（捕获 ERROR 日志与未捕获异常）
@@ -285,33 +294,44 @@ def start():
     # 注册 reload 回调（供 mjb.reload 命令调用）
     mjbc.set_reload_callback(reload_all)
 
-    logger.info(f"Webhook 服务启动，监听端口 {mjbconfig.get_webhook_port()}")
+    accounts = mjbconfig.get_account_list()
+    if accounts:
+        logger.info(f"多账号 Webhook 服务已启动: {', '.join(f'{b}:{mjbconfig.get_webhook_port(b)}' for b in accounts)}")
+    else:
+        logger.info(f"Webhook 服务启动，监听端口 {mjbconfig.get_webhook_port()}")
     socket.run()
+    # run() 非阻塞，阻塞主线程保持存活
+    socket.wait()
 
 
 def _send_startup_notice():
-    """启动时向主群发送自检通知。
+    """启动时向各账号主群发送自检通知。
 
-    与 1.0.2 行为一致：发送"正在连接..."/"正在自检多个模块..."，等待 3 秒，
-    再发送"自检成功，当前监听QQ号: ..."。
+    与 1.0.2 行为一致：发送"正在连接..."/"正在自检多个模块..."，
+    再发送"自检成功，当前监听QQ号: ..."；对每个账号分别发送。
     """
-    target_group = mjbconfig.get_target_group()
-    if not target_group or target_group == "0":
-        logger.info("未设置目标群号，跳过自检消息发送")
-        return
+    for bid in mjbconfig.get_account_list():
+        try:
+            mjbconfig.set_current_bot_id(bid)
+            target_group = mjbconfig.get_target_group()
+            if not target_group or target_group == "0":
+                logger.info(f"账号{bid} 未设置目标群号，跳过自检消息发送")
+                continue
 
-    try:
-        send.group(target_group, "正在连接...")
-        send.group(target_group, "正在自检多个模块...")
-        if _selfcheck_failures:
-            notice = f"存在自检失败项：{len(_selfcheck_failures)}项\n" + "\n".join(_selfcheck_failures)
-            send.group(target_group, notice)
-            logger.warning(f"已在群{target_group}发送自检结果（{len(_selfcheck_failures)}项失败）")
-        else:
-            send.group(target_group, "自检成功")
-            logger.info(f"已在群{target_group}发送自检成功消息")
-    except Exception as e:
-        logger.error(f"发送自检消息失败: {e}")
+            try:
+                send.group(target_group, "正在连接...")
+                send.group(target_group, "正在自检多个模块...")
+                if _selfcheck_failures:
+                    notice = f"存在自检失败项：{len(_selfcheck_failures)}项\n" + "\n".join(_selfcheck_failures)
+                    send.group(target_group, notice)
+                    logger.warning(f"账号{bid} 已在群{target_group}发送自检结果（{len(_selfcheck_failures)}项失败）")
+                else:
+                    send.group(target_group, "自检成功")
+                    logger.info(f"账号{bid} 已在群{target_group}发送自检成功消息")
+            except Exception as e:
+                logger.error(f"账号{bid} 发送自检消息失败: {e}")
+        finally:
+            mjbconfig.clear_current_bot_id()
 
 
 if __name__ == "__main__":
