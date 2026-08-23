@@ -23,7 +23,7 @@ def init():
     """初始化内核：加载配置并打印基础信息，同时注册退出钩子。"""
     mjbconfig.load()
 
-    version = mjbconfig.get_version()
+    version = mjbconfig.get_mjbcver_raw()
 
     mjbcoretitle = r"""
                    _     __                              

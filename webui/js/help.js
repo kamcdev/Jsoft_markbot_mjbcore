@@ -13,7 +13,7 @@ async function loadBotData() {
             const data = await response.json();
             
             // 设置内核版本
-            document.getElementById('kernel-version').textContent = data.version || '未知版本';
+            document.getElementById('kernel-version').textContent = get_mjbcver_raw() || '未知版本';
             
             // 渲染命令列表
             renderCommands(data);

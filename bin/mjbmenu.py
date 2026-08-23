@@ -165,7 +165,7 @@ def generate_html(showhidden, is_bot_admin, is_group_admin):
         showhidden, is_bot_admin, is_group_admin)
 
     botname = mjbconfig.get_botname()
-    version = mjbconfig.get_version()
+    version = mjbconfig.get_mjbcver_raw()
     copyright_text = _build_copyright()
 
     # 构建分类区块

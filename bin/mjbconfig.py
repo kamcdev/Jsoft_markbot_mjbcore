@@ -1,9 +1,30 @@
 # -*- coding: utf-8 -*-
 import os
 import json
+import re
 import threading
 
 from bin import logger
+
+_MJBC_VER_RAW = "mjb-1.0.3.5(133)"
+
+
+def get_mjbcver_raw():
+    """获取原始版本号"""
+    return _MJBC_VER_RAW
+
+
+def get_mjbcver():
+    """获取版本号字符串"""
+    m = re.match(r"^[a-zA-Z]+-(.+)\(\d+\)$", _MJBC_VER_RAW)
+    return m.group(1) if m else _MJBC_VER_RAW
+
+
+def get_mjbcver_num():
+    """获取数字版本号"""
+    m = re.search(r"\((\d+)\)", _MJBC_VER_RAW)
+    return m.group(1) if m else ""
+
 
 # ---- 路径常量 ----
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根目录
@@ -36,7 +57,6 @@ def _new_state():
         "config_last_modified": 0.0,
         "botid": "",
         "botname": "",
-        "version": "",
         "listening_qq_list": [],
         "target_group": "",
         "commands_map": {},
@@ -334,11 +354,6 @@ def get_botname(bot_id=None):
     return state["botname"] if state else ""
 
 
-def get_version(bot_id=None):
-    state = _get_state(bot_id)
-    return state["version"] if state else ""
-
-
 def get_listening_qq_list(bot_id=None):
     state = _get_state(bot_id)
     return state["listening_qq_list"] if state else []
@@ -532,7 +547,7 @@ def _load_account(bot_id):
                 state["config"] = json.load(f)
             _apply_group_data(state, state["config"])
             state["config_last_modified"] = os.path.getmtime(gfile)
-            logger.info(f"账号{bot_id} 欢迎使用{state['botname']} {state['version']}")
+            logger.info(f"账号{bot_id} 欢迎使用{state['botname']} {get_mjbcver_raw()}")
             logger.info(f"账号{bot_id} 已加载命令配置: {', '.join(state['commands_map'].keys())}")
             logger.info(f"账号{bot_id} 已读取本地配置文件，正在部署...")
             if state["testmode"]:
@@ -582,7 +597,7 @@ def _reload_account(bot_id):
         state["config_last_modified"] = os.path.getmtime(gfile)
         logger.info(f"账号{bot_id} 配置文件已重载")
         logger.info(
-            f"账号{bot_id} 机器人名称: {state['botname']} / 内核版本: {state['version']} / 机器人QQ: {state['botid']}"
+            f"账号{bot_id} 机器人名称: {state['botname']} / 内核版本: {get_mjbcver_raw()} / 机器人QQ: {state['botid']}"
         )
         logger.info(f"账号{bot_id} 监听QQ列表: {', '.join(state['listening_qq_list'])}")
         logger.info(f"账号{bot_id} 管理员列表: {', '.join(state['admin_list'])}")
@@ -650,7 +665,6 @@ def _apply_group_data(state, group_data):
     """根据当前账号 group.json dict 更新该账号全部运行时派生状态"""
     state["botid"] = str(group_data.get("bqq", 0))
     state["botname"] = str(group_data.get("botname", "mjbcore"))
-    state["version"] = str(group_data.get("version", "1.0.0"))
     state["listening_qq_list"] = _to_list(group_data.get("listeningqq", ""))
     state["target_group"] = str(group_data.get("group", ""))
 

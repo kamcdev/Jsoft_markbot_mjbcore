@@ -29,7 +29,7 @@ def generate():
 
         system_info = platform.system() + " " + platform.release()
         botname = mjbconfig.get_botname()
-        version = mjbconfig.get_version()
+        version = mjbconfig.get_mjbcver_raw()
 
         status_message = f"{botname}\n\n"
         status_message += f"📀内核版本:{version}\n\n"

@@ -125,7 +125,7 @@ def _create_app():
                 "bot_admin_commands": mjbconfig.get_bot_admin_commands(),
                 "group_admin_commands": mjbconfig.get_group_admin_commands(),
                 "commandshidden": mjbconfig.get_commandshidden(),
-                "version": mjbconfig.get_version(),
+                "version": mjbconfig.get_mjbcver_raw(),
             }
             return jsonify(result)
         except Exception as e:
@@ -217,7 +217,7 @@ def _create_app():
                 "cpu_usage": cpu_usage,
                 "memory_usage": memory_usage,
                 "bot_name": mjbconfig.get_botname(),
-                "version": mjbconfig.get_version(),
+                "version": mjbconfig.get_mjbcver_raw(),
                 "client_ip": client_ip,
                 "heartbeat": heartbeat_summary,
                 "background_tasks": worker.get_status(),
