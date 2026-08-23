@@ -6,7 +6,7 @@ import threading
 
 from bin import logger
 
-_MJBC_VER_RAW = "mjb-1.0.3.5(133)"
+_MJBC_VER_RAW = "mjb-1.0.3.6(140)"
 
 
 def get_mjbcver_raw():
