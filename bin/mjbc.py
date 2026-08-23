@@ -211,7 +211,7 @@ def cmd_help(group_id, user_id, config_data, *args):
             import requests
             from bin import mjbconfig as _cfg
             response = requests.post(
-                f"{_cfg.get_LLbot_url()}/send_group_forward_msg",
+                f"{_cfg.get_Onebot_url()}/send_group_forward_msg",
                 json={"group_id": int(group_id), "messages": result["forward_messages"]},
                 timeout=15,
             )

@@ -71,7 +71,7 @@ def _new_state():
         "webui_dir": None,
         "webhook_port": _DEFAULT_WEBHOOK_PORT,
         "send_port": _DEFAULT_SEND_PORT,
-        "LLbot_URL": f"http://127.0.0.1:{_DEFAULT_SEND_PORT}",
+        "Onebot_URL": f"http://127.0.0.1:{_DEFAULT_SEND_PORT}",
     }
 
 
@@ -274,10 +274,10 @@ def _resolve_ports(bot_id):
     return int(webhook_port), int(send_port)
 
 
-def get_LLbot_url(bot_id=None):
+def get_Onebot_url(bot_id=None):
     state = _get_state(bot_id)
-    if state is not None and state["LLbot_URL"]:
-        return state["LLbot_URL"]
+    if state is not None and state["Onebot_URL"]:
+        return state["Onebot_URL"]
     resolved = _resolve_bot_id(bot_id)
     if resolved:
         _, send_port = _resolve_ports(resolved)
@@ -713,7 +713,7 @@ def _apply_group_data(state, group_data):
         send_port = group_data.get("send_port", _DEFAULT_SEND_PORT)
     state["webhook_port"] = int(webhook_port)
     state["send_port"] = int(send_port)
-    state["LLbot_URL"] = f"http://127.0.0.1:{state['send_port']}"
+    state["Onebot_URL"] = f"http://127.0.0.1:{state['send_port']}"
 
     # 重新应用 autoreg 缓存（热重载后保持模块注册的命令）
     _apply_autoreg_cache(state)

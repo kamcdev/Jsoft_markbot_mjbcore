@@ -6,7 +6,7 @@ from bin import logger, mjbconfig
 
 
 def _url(action, bot_id=None, group_id=None):
-    """构造 LLbotQQ API 地址
+    """构造 OnebotQQ API 地址
 
     bot_id 为 None 且当前线程无账号上下文时，根据 group_id 查找关联账号
     （用于后台线程/定时任务中模块无上下文调用 send.group 的回退场景）
@@ -16,11 +16,11 @@ def _url(action, bot_id=None, group_id=None):
             mapped = mjbconfig.get_bot_id_by_group(str(group_id))
             if mapped:
                 bot_id = mapped
-    return f"{mjbconfig.get_LLbot_url(bot_id)}/{action}"
+    return f"{mjbconfig.get_Onebot_url(bot_id)}/{action}"
 
 
 def api(action, bot_id=None, **payload):
-    """通用 LLbotQQ HTTP API 调用"""
+    """通用 OnebotQQ HTTP API 调用"""
     try:
         group_id = payload.get("group_id")
         response = requests.post(_url(action, bot_id, group_id), json=payload, timeout=15)
@@ -192,7 +192,7 @@ def send_group_file(group_id, file_path, file_name=None, folder_id=None, bot_id=
         return (False, str(e))
 
 
-# ---- LLbotQQ API 封装 ----
+# ---- OnebotQQ API 封装 ----
 def get_group_member_role(group_id, user_id, bot_id=None):
     """获取群成员身份：owner/admin/member/unknown"""
     try:
