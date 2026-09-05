@@ -6,7 +6,7 @@ import threading
 
 from bin import logger, kadset
 
-_MJBC_VER_RAW = "mjb-1.0.3.6(140)"
+_MJBC_VER_RAW = "mjb-1.0.3.7(145)"
 
 
 def get_mjbcver_raw():
