@@ -4,7 +4,7 @@ import json
 import re
 import threading
 
-from bin import logger
+from bin import logger, kadset
 
 _MJBC_VER_RAW = "mjb-1.0.3.6(140)"
 
@@ -38,6 +38,56 @@ _DEFAULT_SEND_PORT = 3002
 
 # ---- 账号列表（account.json）----
 _accounts = {}  # bot_id(str) -> {"webhook_port": int, "send_port": int}
+
+def _kadset_file(path):
+    """json 配置路径对应的 kadset 路径（group.json -> group.kadset）"""
+    if path.endswith(".json"):
+        return path[:-len(".json")] + ".kadset"
+    return path + ".kadset"
+
+
+def _read_config_file(path):
+    """读取配置文件：优先 json，无 json 读对应位置 kadset，都不存在返回 None"""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    kpath = _kadset_file(path)
+    if os.path.exists(kpath):
+        with open(kpath, "r", encoding="utf-8") as f:
+            return kadset.load(f)
+    return None
+
+
+def _write_config_file(path, data):
+    """写配置文件：kadset 存在且 json 不存在时写 kadset（保持原格式），否则写 json
+
+    返回实际写入的路径。
+    """
+    kpath = _kadset_file(path)
+    if not os.path.exists(path) and os.path.exists(kpath):
+        with open(kpath, "w", encoding="utf-8") as f:
+            kadset.dump(data, f, ensure_ascii=False, indent=4)
+        return kpath
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+    return path
+
+
+def _config_file_exists(path):
+    """配置文件存在性判定：json 或对应 kadset 任一存在即存在"""
+    return os.path.exists(path) or os.path.exists(_kadset_file(path))
+
+
+def _config_file_mtime(path):
+    """配置文件最新 mtime：json / kadset 取较新者（都不存在返回 0）"""
+    mtimes = []
+    for p in (path, _kadset_file(path)):
+        try:
+            if os.path.exists(p):
+                mtimes.append(os.path.getmtime(p))
+        except OSError:
+            pass
+    return max(mtimes) if mtimes else 0.0
 
 # ---- 运行时状态：每账号独立（config/<bot_id>/group.json）----
 _account_states = {}  # bot_id(str) -> state dict（见 _new_state）
@@ -106,13 +156,12 @@ def _to_list(data):
 
 # ===================== 账号列表（account.json） =====================
 def load_accounts():
-    """读取根目录 account.json，格式 {QQ: {webhook_port, send_port}}"""
+    """读取根目录 account.json（json 优先，无则读 account.kadset），格式 {QQ: {webhook_port, send_port}}"""
     global _accounts
     _accounts = {}
-    if os.path.exists(_ACCOUNT_FILE):
+    if _config_file_exists(_ACCOUNT_FILE):
         try:
-            with open(_ACCOUNT_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
+            raw = _read_config_file(_ACCOUNT_FILE)
             if isinstance(raw, dict):
                 for bot_id, ports in raw.items():
                     if not isinstance(ports, dict):
@@ -135,7 +184,7 @@ def _discover_accounts_from_config_dir():
         return
     for name in sorted(os.listdir(_CONFIG_DIR)):
         full = os.path.join(_CONFIG_DIR, name)
-        if os.path.isdir(full) and name != "modcfg" and os.path.exists(os.path.join(full, "group.json")):
+        if os.path.isdir(full) and name != "modcfg" and _config_file_exists(os.path.join(full, "group.json")):
             if name not in _accounts:
                 _accounts[name] = {
                     "webhook_port": _DEFAULT_WEBHOOK_PORT,
@@ -276,10 +325,9 @@ def _resolve_ports(bot_id):
         send_port = acc.get("send_port")
     if webhook_port is None or send_port is None:
         gfile = _group_file(bot_id)
-        if os.path.exists(gfile):
+        if _config_file_exists(gfile):
             try:
-                with open(gfile, "r", encoding="utf-8") as f:
-                    gdata = json.load(f)
+                gdata = _read_config_file(gfile)
                 if isinstance(gdata, dict):
                     if webhook_port is None:
                         webhook_port = gdata.get("webhook_port")
@@ -495,22 +543,23 @@ def get_webui_dir(bot_id=None):
 
 # ===================== 配置修改检测 / 保存 =====================
 def check_modified(bot_id=None):
-    """检查当前账号 group.json 是否被外部修改（mtime 变化）"""
+    """检查当前账号 group.json（或 group.kadset）是否被外部修改（mtime 变化）"""
     resolved = _resolve_bot_id(bot_id)
     if not resolved:
         return False
     state = _get_state(resolved)
     try:
         gfile = _group_file(resolved)
-        if os.path.exists(gfile):
-            return os.path.getmtime(gfile) > state["config_last_modified"]
+        mtime = _config_file_mtime(gfile)
+        if mtime > 0:
+            return mtime > state["config_last_modified"]
     except Exception as e:
         logger.error(f"检查配置文件修改状态时出错: {e}")
     return False
 
 
 def save(data=None, bot_id=None):
-    """写回当前账号 group.json"""
+    """写回当前账号 group.json（原 kadset 文件保持 kadset 格式）"""
     resolved = _resolve_bot_id(bot_id)
     if not resolved:
         return False
@@ -520,9 +569,8 @@ def save(data=None, bot_id=None):
             state["config"] = data
         gfile = _group_file(resolved)
         os.makedirs(os.path.dirname(gfile), exist_ok=True)
-        with open(gfile, "w", encoding="utf-8") as f:
-            json.dump(state["config"], f, ensure_ascii=False, indent=4)
-        state["config_last_modified"] = os.path.getmtime(gfile)
+        written = _write_config_file(gfile, state["config"])
+        state["config_last_modified"] = os.path.getmtime(written)
         return True
     except Exception as e:
         logger.error(f"保存配置文件失败: {e}")
@@ -538,29 +586,27 @@ def load():
 
 
 def _load_account(bot_id):
-    """加载单个账号的 group.json / config.json 到账号状态"""
+    """加载单个账号的 group.json / config.json（json 优先，kadset 兜底）到账号状态"""
     state = _get_state(bot_id)
     gfile = _group_file(bot_id)
     try:
-        if os.path.exists(gfile):
-            with open(gfile, "r", encoding="utf-8") as f:
-                state["config"] = json.load(f)
+        if _config_file_exists(gfile):
+            state["config"] = _read_config_file(gfile)
             _apply_group_data(state, state["config"])
-            state["config_last_modified"] = os.path.getmtime(gfile)
+            state["config_last_modified"] = _config_file_mtime(gfile)
             logger.info(f"账号{bot_id} 欢迎使用{state['botname']} {get_mjbcver_raw()}")
             logger.info(f"账号{bot_id} 已加载命令配置: {', '.join(state['commands_map'].keys())}")
             logger.info(f"账号{bot_id} 已读取本地配置文件，正在部署...")
             if state["testmode"]:
                 logger.info(f"账号{bot_id} 调试模式已开启，仅群{state['testgp']}可触发bot")
         else:
-            logger.error(f"账号{bot_id} 未找到 group.json，请先配置: {gfile}")
+            logger.error(f"账号{bot_id} 未找到 group.json/group.kadset，请先配置: {gfile}")
     except Exception as e:
         logger.error(f"账号{bot_id} 读取配置文件失败: {e}")
 
     try:
-        if os.path.exists(_CONFIG_FILE):
-            with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
-                state["config_config"] = json.load(f)
+        if _config_file_exists(_CONFIG_FILE):
+            state["config_config"] = _read_config_file(_CONFIG_FILE)
     except Exception as e:
         logger.error(f"读取 config.json 失败: {e}")
 
@@ -588,13 +634,12 @@ def _reload_account(bot_id):
     state = _get_state(bot_id)
     gfile = _group_file(bot_id)
     try:
-        if not os.path.exists(gfile):
-            logger.error(f"账号{bot_id} 未找到 group.json，无法重载")
+        if not _config_file_exists(gfile):
+            logger.error(f"账号{bot_id} 未找到 group.json/group.kadset，无法重载")
             return False
-        with open(gfile, "r", encoding="utf-8") as f:
-            state["config"] = json.load(f)
+        state["config"] = _read_config_file(gfile)
         _apply_group_data(state, state["config"])
-        state["config_last_modified"] = os.path.getmtime(gfile)
+        state["config_last_modified"] = _config_file_mtime(gfile)
         logger.info(f"账号{bot_id} 配置文件已重载")
         logger.info(
             f"账号{bot_id} 机器人名称: {state['botname']} / 内核版本: {get_mjbcver_raw()} / 机器人QQ: {state['botid']}"
@@ -838,16 +883,15 @@ def apply_module_autoreg(autoreg, module_name="", bot_id=None):
 
 # ===================== 模块配置（config/<bot_id>/modcfg/） =====================
 def load_module_config(name, bot_id=None):
-    """从 config/<bot_id>/modcfg/ 读取模块配置；兼容回退：文件不存在时返回 {}"""
+    """从 config/<bot_id>/modcfg/ 读取模块配置（json 优先，kadset 兜底）；不存在返回 {}"""
     resolved = _resolve_bot_id(bot_id)
     if not resolved:
         return {}
     paths = [os.path.join(_modcfg_dir(resolved), name), _core_config_file(resolved, name)]
     for path in paths:
-        if os.path.exists(path):
+        if _config_file_exists(path):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                return _read_config_file(path)
             except Exception as e:
                 logger.error(f"加载模块配置 {name} 失败: {e}")
                 return {}
@@ -855,7 +899,7 @@ def load_module_config(name, bot_id=None):
 
 
 def save_module_config(name, data, bot_id=None):
-    """写入模块配置到 config/<bot_id>/modcfg/"""
+    """写入模块配置到 config/<bot_id>/modcfg/（原 kadset 文件保持 kadset 格式）"""
     resolved = _resolve_bot_id(bot_id)
     if not resolved:
         return False
@@ -863,8 +907,7 @@ def save_module_config(name, data, bot_id=None):
         mdir = _modcfg_dir(resolved)
         os.makedirs(mdir, exist_ok=True)
         path = os.path.join(mdir, name)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        _write_config_file(path, data)
         return True
     except Exception as e:
         logger.error(f"保存模块配置 {name} 失败: {e}")
@@ -873,15 +916,16 @@ def save_module_config(name, data, bot_id=None):
 
 # ===================== 核心配置（config/<bot_id>/） =====================
 def load_banuser(bot_id=None):
-    """读取黑名单 banuser.json -> {"banned_users": {...}}"""
+    """读取黑名单 banuser.json（json 优先，kadset 兜底）-> {"banned_users": {...}}"""
     resolved = _resolve_bot_id(bot_id)
     if not resolved:
         return {}
     path = _core_config_file(resolved, "banuser.json")
-    if os.path.exists(path):
+    if _config_file_exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f).get("banned_users", {})
+            data = _read_config_file(path)
+            if isinstance(data, dict):
+                return data.get("banned_users", {})
         except Exception as e:
             logger.error(f"读取banuser.json失败: {e}")
     return {}
@@ -894,8 +938,7 @@ def save_banuser(banned_users, bot_id=None):
     try:
         path = _core_config_file(resolved, "banuser.json")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"banned_users": banned_users}, f, ensure_ascii=False, indent=4)
+        _write_config_file(path, {"banned_users": banned_users})
         return True
     except Exception as e:
         logger.error(f"保存banuser.json失败: {e}")
@@ -907,10 +950,11 @@ def load_gpevent(bot_id=None):
     if not resolved:
         return {}
     path = _core_config_file(resolved, "gpevent.json")
-    if os.path.exists(path):
+    if _config_file_exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            data = _read_config_file(path)
+            if isinstance(data, dict):
+                return data
         except Exception as e:
             logger.error(f"读取gpevent.json失败: {e}")
     return {}
@@ -923,8 +967,7 @@ def save_gpevent(data, bot_id=None):
     try:
         path = _core_config_file(resolved, "gpevent.json")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        _write_config_file(path, data)
         return True
     except Exception as e:
         logger.error(f"保存gpevent.json失败: {e}")
@@ -936,10 +979,11 @@ def load_gpauths(bot_id=None):
     if not resolved:
         return {}
     path = _core_config_file(resolved, "gpauths.json")
-    if os.path.exists(path):
+    if _config_file_exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            data = _read_config_file(path)
+            if isinstance(data, dict):
+                return data
         except Exception as e:
             logger.error(f"读取gpauths.json失败: {e}")
     return {}
@@ -952,8 +996,7 @@ def save_gpauths(data, bot_id=None):
     try:
         path = _core_config_file(resolved, "gpauths.json")
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        _write_config_file(path, data)
         return True
     except Exception as e:
         logger.error(f"保存gpauths.json失败: {e}")
