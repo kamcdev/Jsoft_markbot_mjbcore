@@ -199,8 +199,17 @@ def _to_list(data):
 
 
 # ===================== 账号列表（coreset account 键） =====================
+def _norm_token(value):
+    """规范化 token：键不存在/空串/纯空白均视为未设置（返回 None）"""
+    if value is None:
+        return None
+    token = str(value).strip()
+    return token or None
+
+
 def load_accounts():
-    """读取 coreset 配置的 account 键（coreset.json，kadset 兜底），格式 {QQ: {webhook_port, send_port}}"""
+    """读取 coreset 配置的 account 键（coreset.json，kadset 兜底），
+    格式 {QQ: {webhook_port, send_port, webhook_token, send_token}}"""
     global _accounts
     _accounts = {}
     _load_coreset()
@@ -212,6 +221,8 @@ def load_accounts():
             _accounts[str(bot_id)] = {
                 "webhook_port": int(ports.get("webhook_port", _DEFAULT_WEBHOOK_PORT)),
                 "send_port": int(ports.get("send_port", _DEFAULT_SEND_PORT)),
+                "webhook_token": _norm_token(ports.get("webhook_token")),
+                "send_token": _norm_token(ports.get("send_token")),
             }
     if not _accounts:
         # 回退：从 config/ 目录自动发现账号
@@ -230,11 +241,13 @@ def _discover_accounts_from_config_dir():
                 _accounts[name] = {
                     "webhook_port": _DEFAULT_WEBHOOK_PORT,
                     "send_port": _DEFAULT_SEND_PORT,
+                    "webhook_token": None,
+                    "send_token": None,
                 }
 
 
 def get_accounts():
-    """返回账号列表 dict：{bot_id: {"webhook_port": int, "send_port": int}}"""
+    """返回账号列表 dict：{bot_id: {"webhook_port": int, "send_port": int, "webhook_token": str|None, "send_token": str|None}}"""
     if not _accounts:
         load_accounts()
     return dict(_accounts)
@@ -414,6 +427,30 @@ def get_send_port(bot_id=None):
         _, send_port = _resolve_ports(resolved)
         return send_port
     return _DEFAULT_SEND_PORT
+
+
+def get_webhook_token(bot_id=None):
+    """读取账号的 webhook_token（coreset.account 配置）
+
+    用于校验 OnebotQQ 上报请求的 Authorization 头；键不存在或为空返回 None（不做校验）。
+    """
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return None
+    acc = get_accounts().get(str(resolved), {})
+    return acc.get("webhook_token") if isinstance(acc, dict) else None
+
+
+def get_send_token(bot_id=None):
+    """读取账号的 send_token（coreset.account 配置）
+
+    用于调用 OnebotQQ API 时附带 Authorization 头；键不存在或为空返回 None（不携带）。
+    """
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return None
+    acc = get_accounts().get(str(resolved), {})
+    return acc.get("send_token") if isinstance(acc, dict) else None
 
 
 # ===================== 通用 getter（按当前账号状态读取，签名向后兼容） =====================

@@ -206,12 +206,9 @@ def cmd_help(group_id, user_id, config_data, *args):
 
         result = mjbmenu.generate(config_data, is_bot_admin, is_group_admin, showhidden)
         try:
-            requests_post = send.api  # 通用 API
-            # 直接调用合并转发接口发送节点
-            import requests
-            from bin import mjbconfig as _cfg
-            response = requests.post(
-                f"{_cfg.get_Onebot_url()}/send_group_forward_msg",
+            # 直接调用合并转发接口发送节点（统一走 send._post，自动附带账号 token）
+            response = send._post(
+                "send_group_forward_msg", group_id=group_id,
                 json={"group_id": int(group_id), "messages": result["forward_messages"]},
                 timeout=15,
             )

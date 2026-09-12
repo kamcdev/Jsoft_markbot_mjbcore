@@ -5,8 +5,8 @@ import requests
 from bin import logger, mjbconfig
 
 
-def _url(action, bot_id=None, group_id=None):
-    """构造 OnebotQQ API 地址
+def _resolve_bot(bot_id=None, group_id=None):
+    """解析目标账号：显式 bot_id > （无线程上下文时）group_id 映射 > 当前上下文/默认账号
 
     bot_id 为 None 且当前线程无账号上下文时，根据 group_id 查找关联账号
     （用于后台线程/定时任务中模块无上下文调用 send.group 的回退场景）
@@ -16,14 +16,36 @@ def _url(action, bot_id=None, group_id=None):
             mapped = mjbconfig.get_bot_id_by_group(str(group_id))
             if mapped:
                 bot_id = mapped
-    return f"{mjbconfig.get_Onebot_url(bot_id)}/{action}"
+    return bot_id
+
+
+def _url(action, bot_id=None, group_id=None):
+    """构造 OnebotQQ API 地址"""
+    return f"{mjbconfig.get_Onebot_url(_resolve_bot(bot_id, group_id))}/{action}"
+
+
+def _headers(bot_id=None, group_id=None):
+    """按账号配置构造请求头：设置了 send_token 时附带 Authorization: Bearer <token>"""
+    token = mjbconfig.get_send_token(_resolve_bot(bot_id, group_id))
+    if not token:
+        return None
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _post(action, bot_id=None, group_id=None, **kwargs):
+    """统一 API POST 入口：按账号自动附带 token（未配置 token 时不携带）"""
+    return requests.post(
+        _url(action, bot_id, group_id),
+        headers=_headers(bot_id, group_id),
+        **kwargs
+    )
 
 
 def api(action, bot_id=None, **payload):
     """通用 OnebotQQ HTTP API 调用"""
     try:
         group_id = payload.get("group_id")
-        response = requests.post(_url(action, bot_id, group_id), json=payload, timeout=15)
+        response = _post(action, bot_id, group_id, json=payload, timeout=15)
         return response.json()
     except Exception as e:
         logger.error(f"调用 API {action} 失败: {e}")
@@ -35,7 +57,7 @@ def group(group_id, message, bot_id=None):
     try:
         if group_id == 0:
             return
-        requests.post(_url("send_group_msg", bot_id, group_id), json={
+        _post("send_group_msg", bot_id, group_id, json={
             "group_id": group_id,
             "message": [{"type": "text", "data": {"text": message}}],
         }, timeout=15)
@@ -51,7 +73,7 @@ def group_at(group_id, qq_number, text_message="", bot_id=None):
         message_content = [{"type": "at", "data": {"qq": str(qq_number)}}]
         if text_message:
             message_content.append({"type": "text", "data": {"text": text_message}})
-        requests.post(_url("send_group_msg", bot_id, group_id), json={
+        _post("send_group_msg", bot_id, group_id, json={
             "group_id": group_id,
             "message": message_content,
         }, timeout=15)
@@ -67,7 +89,7 @@ def group_reply(group_id, user_id, message_id, content, bot_id=None):
             {"type": "at", "data": {"qq": int(user_id)}},
             {"type": "text", "data": {"text": f" {content}"}},
         ]
-        requests.post(_url("send_group_msg", bot_id, group_id), json={
+        _post("send_group_msg", bot_id, group_id, json={
             "group_id": int(group_id),
             "message": message_content,
         }, timeout=15)
@@ -96,7 +118,7 @@ def group_image(group_id, image_path, bot_id=None):
             "group_id": int(group_id) if isinstance(group_id, str) else group_id,
             "message": [{"type": "image", "data": {"file": abs_image_path}}],
         }
-        response = requests.post(_url("send_group_msg", bot_id, group_id), json=payload, timeout=15)
+        response = _post("send_group_msg", bot_id, group_id, json=payload, timeout=15)
         response.raise_for_status()
         logger.debug(f"图片消息发送成功，响应: {response.json()}")
         return True
@@ -121,7 +143,7 @@ def private(user_id, content, bot_id=None):
             "user_id": int(user_id),
             "message": [{"type": "text", "data": {"text": content}}],
         }
-        response = requests.post(_url("send_private_msg", bot_id), json=payload, timeout=15)
+        response = _post("send_private_msg", bot_id, json=payload, timeout=15)
         response.raise_for_status()
         logger.info(f"私聊消息发送成功: 用户{user_id}")
         return True
@@ -151,7 +173,7 @@ def send_group_forward_msg(group_id, messages, fake_qq=None, fake_name=None, bot
             node_data["data"]["uin"] = fake_qq
         if fake_name:
             node_data["data"]["name"] = fake_name
-        response = requests.post(_url("send_group_forward_msg", bot_id, group_id), json={
+        response = _post("send_group_forward_msg", bot_id, group_id, json={
             "group_id": group_id,
             "messages": [node_data],
         }, timeout=15)
@@ -176,7 +198,7 @@ def send_group_file(group_id, file_path, file_name=None, folder_id=None, bot_id=
         payload = {"group_id": int(group_id), "file": file_path, "name": file_name}
         if folder_id:
             payload["folder_id"] = folder_id
-        response = requests.post(_url("upload_group_file", bot_id, group_id), json=payload, timeout=30)
+        response = _post("upload_group_file", bot_id, group_id, json=payload, timeout=30)
         if response.status_code == 200:
             result = response.json()
             if result.get("status") == "ok":
@@ -197,7 +219,7 @@ def get_group_member_role(group_id, user_id, bot_id=None):
     """获取群成员身份：owner/admin/member/unknown"""
     try:
         payload = {"group_id": int(group_id), "user_id": int(user_id), "no_cache": False}
-        response = requests.post(_url("get_group_member_info", bot_id, group_id), json=payload, timeout=10)
+        response = _post("get_group_member_info", bot_id, group_id, json=payload, timeout=10)
         if response.status_code == 200:
             data = response.json()
             if data.get("status") == "ok" and "data" in data:
@@ -211,7 +233,7 @@ def get_group_member_role(group_id, user_id, bot_id=None):
 def get_group_member_info(group_id, user_id, bot_id=None):
     """获取群成员信息（完整 dict）"""
     try:
-        response = requests.post(_url("get_group_member_info", bot_id, group_id), json={
+        response = _post("get_group_member_info", bot_id, group_id, json={
             "group_id": int(group_id), "user_id": int(user_id),
         }, timeout=10)
         if response.status_code == 200:
@@ -227,7 +249,7 @@ def get_group_member_info(group_id, user_id, bot_id=None):
 def get_group_member_list(group_id, bot_id=None):
     """获取群成员列表"""
     try:
-        response = requests.post(_url("get_group_member_list", bot_id, group_id), json={
+        response = _post("get_group_member_list", bot_id, group_id, json={
             "group_id": group_id,
         }, timeout=10)
         result = response.json()
@@ -242,7 +264,7 @@ def get_group_member_list(group_id, bot_id=None):
 def get_stranger_info(user_id, bot_id=None):
     """获取用户信息"""
     try:
-        response = requests.post(_url("get_stranger_info", bot_id), json={
+        response = _post("get_stranger_info", bot_id, json={
             "user_id": user_id,
         }, timeout=10)
         result = response.json()
@@ -257,7 +279,7 @@ def get_stranger_info(user_id, bot_id=None):
 def delete_msg(message_id, bot_id=None):
     """撤回消息"""
     try:
-        requests.post(_url("delete_msg", bot_id), json={"message_id": int(message_id)}, timeout=5)
+        _post("delete_msg", bot_id, json={"message_id": int(message_id)}, timeout=5)
         return True
     except Exception as e:
         logger.error(f"撤回消息失败: {e}")
@@ -267,7 +289,7 @@ def delete_msg(message_id, bot_id=None):
 def set_group_kick(group_id, user_id, reject_add_request=False, bot_id=None):
     """踢出群成员"""
     try:
-        requests.post(_url("set_group_kick", bot_id, group_id), json={
+        _post("set_group_kick", bot_id, group_id, json={
             "group_id": int(group_id), "user_id": int(user_id),
             "reject_add_request": reject_add_request,
         }, timeout=5)
@@ -281,7 +303,7 @@ def set_group_kick(group_id, user_id, reject_add_request=False, bot_id=None):
 def set_group_ban(group_id, user_id, duration=0, bot_id=None):
     """禁言成员（duration 秒，0 表示解除）"""
     try:
-        requests.post(_url("set_group_ban", bot_id, group_id), json={
+        _post("set_group_ban", bot_id, group_id, json={
             "group_id": int(group_id), "user_id": int(user_id),
             "duration": int(duration),
         }, timeout=5)

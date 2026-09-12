@@ -2,7 +2,9 @@
     "account": {
         "10000": {
             "webhook_port": 9762,
-            "send_port": 3002
+            "send_port": 3002,
+            "webhook_token": "",
+            "send_token": ""
         }
     },
     "ffmpeg_path": "在此处设置ffmpeg路径",

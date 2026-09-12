@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import secrets
 import threading
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 import uvicorn
 
 from bin import logger, mjbconfig, message, worker
@@ -15,6 +17,22 @@ _loops = {}
 
 # Webhook uvicorn 服务器登记表：bot_id -> {"server":.., "port":.., "thread":..}
 _webhook_servers = {}
+
+
+def _check_token(request, bot_id=None):
+    """校验上报请求的 Authorization 头
+
+    coreset.account.<QQ>.webhook_token 未配置（键不存在/为空）时直接放行；
+    配置了则要求 "Authorization: Bearer <token>" 匹配，否则拒绝该请求。
+    """
+    token = mjbconfig.get_webhook_token(bot_id)
+    if not token:
+        return True
+    auth = request.headers.get("Authorization", "")
+    if secrets.compare_digest(auth, f"Bearer {token}"):
+        return True
+    logger.warning(f"账号{bot_id} 收到本账号上报请求但 token 校验失败，已拒绝")
+    return False
 
 
 def create_app(bot_id=None):
@@ -30,6 +48,13 @@ def create_app(bot_id=None):
         if bot_id is not None:
             mjbconfig.set_current_bot_id(bot_id)
         try:
+            # 校验上报 token（未配置 webhook_token 时不校验）
+            if not _check_token(request, bot_id):
+                return JSONResponse(
+                    status_code=401,
+                    content={"status": "error", "message": "invalid token"},
+                )
+
             # 记录该 app 的事件循环（供 run_on_main_thread 使用）
             _loops[bot_id] = asyncio.get_running_loop()
 
