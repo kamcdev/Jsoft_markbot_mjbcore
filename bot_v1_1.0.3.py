@@ -22,6 +22,8 @@ _cleanup_done = False
 def init():
     """初始化内核：加载配置并打印基础信息，同时注册退出钩子。"""
     mjbconfig.load()
+    # 根据 coreset.log_output 开启文件日志（需在配置加载后调用）
+    logger.setup_file_logging()
 
     version = mjbconfig.get_mjbcver_raw()
 

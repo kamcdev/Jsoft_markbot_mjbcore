@@ -12,10 +12,6 @@
     "admin": [
         "bot管理员qq号"
     ],
-    "ffmpeg_path": "在此处设置ffmpeg路径",
-    "webui_path": "webui",
-    "bot_path": "在此处设置bot本体程序(bot_v1_1.x.x.py)所在路径",
-    "plugin_list": [],
     "commands": {
         "help": "help",
         "echo": "echo",

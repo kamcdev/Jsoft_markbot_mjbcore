@@ -28,15 +28,18 @@ def get_mjbcver_num():
 
 # ---- 路径常量 ----
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根目录
-_ACCOUNT_FILE = os.path.join(_ROOT, "account.json")   # 账号列表 {QQ: {webhook_port, send_port}}
+_CORESET_FILE = os.path.join(_ROOT, "coreset.json")  # 全局核心配置 coreset.json/kadset（账号列表、全局路径等）
 _CONFIG_DIR = os.path.join(_ROOT, "config")           # 账号配置目录 config/<bot_id>/
 _CONFIG_FILE = os.path.join(_ROOT, "config.json")     # 全局 config.json（保留在根目录）
 
-# 默认端口（account.json / group.json 均未配置时使用）
+# 默认端口（coreset account / group.json 均未配置时使用）
 _DEFAULT_WEBHOOK_PORT = 9762
 _DEFAULT_SEND_PORT = 3002
 
-# ---- 账号列表（account.json）----
+# ---- 全局核心配置（coreset.json / coreset.kadset）----
+_coreset_data = {}  # 根目录 coreset 配置 dict
+
+# ---- 账号列表（coreset account 键）----
 _accounts = {}  # bot_id(str) -> {"webhook_port": int, "send_port": int}
 
 def _kadset_file(path):
@@ -88,6 +91,47 @@ def _config_file_mtime(path):
         except OSError:
             pass
     return max(mtimes) if mtimes else 0.0
+
+
+# ===================== 全局核心配置（coreset） =====================
+def _load_coreset():
+    """读取根目录 coreset 配置（coreset.json，kadset 兜底）到 _coreset_data"""
+    global _coreset_data
+    _coreset_data = {}
+    if _config_file_exists(_CORESET_FILE):
+        try:
+            data = _read_config_file(_CORESET_FILE)
+            if isinstance(data, dict):
+                _coreset_data = data
+        except Exception as e:
+            logger.error(f"读取 coreset 配置失败: {e}")
+
+
+def get_coreset_data():
+    """返回根目录 coreset 配置完整 dict（含 account、ffmpeg_path 等全局设置）"""
+    if not _coreset_data:
+        _reload_coreset()
+    return dict(_coreset_data)
+
+
+def get_coreset(key, default=None):
+    """读取 coreset 配置中的单个键"""
+    return get_coreset_data().get(key, default)
+
+
+def _reload_coreset():
+    """重新加载 coreset 配置（bump 版本；内部调用）"""
+    _load_coreset()
+
+
+def get_ffmpeg_path(default=None):
+    """读取全局 FFmpeg 可执行文件路径（coreset 的 ffmpeg_path 键）"""
+    return get_coreset("ffmpeg_path", default)
+
+
+def get_bot_path(default=None):
+    """读取全局 bot 根目录路径（coreset 的 bot_path 键）"""
+    return get_coreset("bot_path", default)
 
 # ---- 运行时状态：每账号独立（config/<bot_id>/group.json）----
 _account_states = {}  # bot_id(str) -> state dict（见 _new_state）
@@ -154,24 +198,21 @@ def _to_list(data):
     return []
 
 
-# ===================== 账号列表（account.json） =====================
+# ===================== 账号列表（coreset account 键） =====================
 def load_accounts():
-    """读取根目录 account.json（json 优先，无则读 account.kadset），格式 {QQ: {webhook_port, send_port}}"""
+    """读取 coreset 配置的 account 键（coreset.json，kadset 兜底），格式 {QQ: {webhook_port, send_port}}"""
     global _accounts
     _accounts = {}
-    if _config_file_exists(_ACCOUNT_FILE):
-        try:
-            raw = _read_config_file(_ACCOUNT_FILE)
-            if isinstance(raw, dict):
-                for bot_id, ports in raw.items():
-                    if not isinstance(ports, dict):
-                        ports = {}
-                    _accounts[str(bot_id)] = {
-                        "webhook_port": int(ports.get("webhook_port", _DEFAULT_WEBHOOK_PORT)),
-                        "send_port": int(ports.get("send_port", _DEFAULT_SEND_PORT)),
-                    }
-        except Exception as e:
-            logger.error(f"读取 account.json 失败: {e}")
+    _load_coreset()
+    raw = get_coreset("account", None)
+    if isinstance(raw, dict):
+        for bot_id, ports in raw.items():
+            if not isinstance(ports, dict):
+                ports = {}
+            _accounts[str(bot_id)] = {
+                "webhook_port": int(ports.get("webhook_port", _DEFAULT_WEBHOOK_PORT)),
+                "send_port": int(ports.get("send_port", _DEFAULT_SEND_PORT)),
+            }
     if not _accounts:
         # 回退：从 config/ 目录自动发现账号
         _discover_accounts_from_config_dir()
@@ -179,7 +220,7 @@ def load_accounts():
 
 
 def _discover_accounts_from_config_dir():
-    """account.json 缺失/为空时，从 config/<QQ>/ 目录自动发现账号（端口用默认值）"""
+    """coreset.account 缺失/为空时，从 config/<QQ>/ 目录自动发现账号（端口用默认值）"""
     if not os.path.isdir(_CONFIG_DIR):
         return
     for name in sorted(os.listdir(_CONFIG_DIR)):
@@ -205,7 +246,7 @@ def get_account_list():
 
 
 def get_default_bot_id():
-    """默认账号 = account.json 第一个账号；无账号时回退 config/ 目录第一个子目录"""
+    """默认账号 = coreset.account 第一个账号；无账号时回退 config/ 目录第一个子目录"""
     accounts = get_accounts()
     if accounts:
         return next(iter(accounts))
@@ -316,7 +357,7 @@ def _core_config_file(bot_id, name):
 
 # ===================== 端口与 API 地址 =====================
 def _resolve_ports(bot_id):
-    """按优先级计算账号端口：account.json > group.json > 默认值"""
+    """按优先级计算账号端口：coreset.account > group.json > 默认值"""
     webhook_port = None
     send_port = None
     acc = get_accounts().get(str(bot_id), {})
@@ -748,8 +789,8 @@ def _apply_group_data(state, group_data):
     state["group_admin_commands"] = _to_list(group_data.get("group_admin_commands", []))
     state["bot_admin_commands"] = _to_list(group_data.get("bot_admin_commands", []))
 
-    # WebUI 目录
-    webui_path = group_data.get("webui_path", None)
+    # WebUI 目录（全局统一设置，从 coreset 读取）
+    webui_path = get_coreset("webui_path", None)
     state["webui_dir"] = None
     if webui_path:
         if not os.path.isabs(webui_path):
@@ -759,7 +800,7 @@ def _apply_group_data(state, group_data):
         if not os.path.exists(state["webui_dir"]):
             state["webui_dir"] = None
 
-    # Webhook 端口和 HTTP 发送端口：account.json 优先、回退 group.json、再回退默认值
+    # Webhook 端口和 HTTP 发送端口：coreset.account 优先、回退 group.json、再回退默认值
     webhook_port = None
     send_port = None
     acc = get_accounts().get(state["botid"], {})

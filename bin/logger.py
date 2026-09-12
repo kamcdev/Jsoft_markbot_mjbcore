@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import traceback
+import shutil
 from datetime import datetime
 
 # ---- 颜色定义（ANSI 转义码）----
@@ -150,6 +151,61 @@ info = logger.info
 warning = logger.warning
 error = logger.error
 critical = logger.critical
+
+
+# ---- 文件日志（coreset.log_output）----
+_file_handler = None  # 文件日志 handler 单例
+
+
+def _setup_file_logging():
+    """若 coreset.log_output 开启则挂载文件日志到 log/log.log（含滚动备份）
+
+    读取 coreset 配置的 log_output 键（bool）。开启时：
+    - 首次启动若 log.log 已存在，依次滚动为 log_old_1.log ... log_old_N.log
+    - 最新一次运行的日志始终写入 log.log
+    返回 True 表示文件日志已启用。
+    """
+    global _file_handler
+    if _file_handler is not None:
+        return True
+    try:
+        from bin import mjbconfig as _m
+        if not _m.get_coreset("log_output", False):
+            return False
+    except Exception:
+        return False
+
+    try:
+        log_dir = os.path.join(_m.get_bot_path() or
+                               os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "log")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "log.log")
+
+        # 滚动备份：log.log -> log_old_1.log，old1 存在则 -> old2，依此类推
+        if os.path.exists(log_file):
+            n = 1
+            while os.path.exists(os.path.join(log_dir, f"log_old_{n}.log")):
+                n += 1
+            shutil.move(log_file, os.path.join(log_dir, f"log_old_{n}.log"))
+
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        logger.addHandler(handler)
+        _file_handler = handler
+        info(f"文件日志已启用: {log_file}")
+        return True
+    except Exception as e:
+        error(f"文件日志启用失败: {e}")
+        return False
+
+
+def setup_file_logging():
+    """公开入口：根据 coreset.log_output 启用文件日志（幂等）"""
+    return _setup_file_logging()
 
 
 def supereye_log_command(group_id, user_id, command_name, command_args, permission_level):
