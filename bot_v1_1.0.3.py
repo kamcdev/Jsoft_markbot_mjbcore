@@ -228,6 +228,7 @@ def reload_all():
     5. 重新加载配置
     6. 重新扫描加载模块
     7. 重新自检通知
+    8. 确保 WebUI 线程运行
     """
     import bin.message as _message
 
@@ -262,6 +263,10 @@ def reload_all():
     logger.info("reload: 重新自检...")
     _send_startup_notice()
 
+    # 8. 确保 WebUI 线程运行（热重载会停止后台线程，此处幂等重启，避免 WebUI 消失）
+    logger.info("reload: 确保 WebUI 线程运行...")
+    webmain.ensure_webui_thread()
+
     logger.info("reload: 重载完成")
 
 
@@ -284,7 +289,7 @@ def _register_exit_hooks():
 
 def start():
     """启动 WebUI（daemon 线程）与 Webhook 服务（socket.wait 阻塞主线程）。"""
-    webmain.start_webui_thread()
+    webmain.ensure_webui_thread()
     logger.info("WebUI 服务已启动（daemon 线程）")
 
     # 启动自检通知（向各账号主群发送连接/自检提示，与 1.0.2 行为一致）
