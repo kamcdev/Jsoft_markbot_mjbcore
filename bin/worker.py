@@ -52,7 +52,7 @@ def submit(fn, *args, **kwargs):
     return _ensure_executor().submit(_run)
 
 
-def start_background(name, target, args=(), kwargs=None, daemon=True, stop_attr=None, stop_event=None):
+def start_background(name, target, args=(), kwargs=None, daemon=True, stop_attr=None, stop_event=None, stop_fn=None):
     """启动并登记一个后台线程
 
     Args:
@@ -61,6 +61,8 @@ def start_background(name, target, args=(), kwargs=None, daemon=True, stop_attr=
         stop_attr: 若 target 是对象，停止其的方法名（如 "stop"），用于优雅退出
         stop_event: threading.Event，会自动注入到 target 的 kwargs 中（参数名 stop_event），
                     用于通知 while 循环退出
+        stop_fn: 可选的停止回调函数（无参调用），优先级低于 stop_attr、高于 stop_event，
+                    用于无法用对象方法/Event 停止的阻塞型线程（如 WebUI server）
     Returns:
         threading.Thread
     """
@@ -93,16 +95,18 @@ def start_background(name, target, args=(), kwargs=None, daemon=True, stop_attr=
             "stop_attr": stop_attr,
             "target": target,
             "stop_event": stop_event,
+            "stop_fn": stop_fn,
         }
     t.start()
     logger.info(f"后台线程已启动: {name}")
     return t
 
 
-def register_thread(name, thread, stop_attr=None):
+def register_thread(name, thread, stop_attr=None, stop_fn=None):
     """登记一个已存在/已启动的线程对象，便于统一回收"""
     with _bg_lock:
-        _background_threads[name] = {"thread": thread, "stop_attr": stop_attr, "target": None}
+        _background_threads[name] = {
+            "thread": thread, "stop_attr": stop_attr, "target": None, "stop_fn": stop_fn}
     logger.info(f"已登记后台线程: {name}")
 
 
@@ -123,7 +127,7 @@ def run_main_tasks():
 
 
 def stop_background(name):
-    """停止指定后台线程（先尝试 stop_attr，再尝试 stop_event）"""
+    """停止指定后台线程（依次尝试 stop_attr、stop_fn、stop_event）"""
     with _bg_lock:
         entry = _background_threads.get(name)
     if not entry:
@@ -138,7 +142,16 @@ def stop_background(name):
             return True
         except Exception as e:
             logger.error(f"停止后台线程 {name} 失败: {e}")
-    # 2. 尝试设置 stop_event
+    # 2. 尝试调用 stop_fn 停止回调
+    stop_fn = entry.get("stop_fn")
+    if stop_fn is not None:
+        try:
+            stop_fn()
+            logger.info(f"已调用后台线程停止回调: {name}")
+            return True
+        except Exception as e:
+            logger.error(f"停止后台线程 {name} 失败: {e}")
+    # 3. 尝试设置 stop_event
     stop_event = entry.get("stop_event")
     if stop_event is not None:
         try:
@@ -180,7 +193,8 @@ def stop_all_background(wait=True, timeout=5):
     """停止所有后台线程，等待退出后清理登记表
 
     用于 reload_all：确保旧线程彻底退出后再重新加载模块，避免线程重复创建。
-    对无停止机制的线程（如 WebUI Flask）仅记录警告，不阻塞。
+    依次尝试 stop_attr、stop_fn、stop_event 请求停止；WebUI Flask 等阻塞型线程
+    现已可通过 stop_fn 正常停止。仅对确实没有任何停止机制的线程记录警告。
     join 超时仍未退出的线程会被强制终止（注入 SystemExit）。
 
     Args:
@@ -194,10 +208,16 @@ def stop_all_background(wait=True, timeout=5):
     for name, entry in entries.items():
         target = entry.get("target")
         stop_attr = entry.get("stop_attr")
+        stop_fn = entry.get("stop_fn")
         stop_event = entry.get("stop_event")
         if target and stop_attr and hasattr(target, stop_attr):
             try:
                 getattr(target, stop_attr)()
+            except Exception as e:
+                logger.error(f"停止后台线程 {name} 失败: {e}")
+        elif stop_fn:
+            try:
+                stop_fn()
             except Exception as e:
                 logger.error(f"停止后台线程 {name} 失败: {e}")
         elif stop_event is not None:

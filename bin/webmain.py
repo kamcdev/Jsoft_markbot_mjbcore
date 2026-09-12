@@ -10,11 +10,21 @@ import threading
 import ipaddress
 
 from flask import Flask, request, jsonify, send_from_directory, make_response
+from werkzeug.serving import make_server
 
 from bin import logger, mjbconfig, mjbstatus, worker, message
 
 _webui_app = None
 _start_time = time.time()
+
+# WebUI 运行状态：server 句柄 / 线程引用 / 状态锁（用于优雅停止与幂等启动）
+_webui_server = None
+_webui_thread = None
+_webui_lock = threading.Lock()
+
+_WEBUI_THREAD_NAME = "WebUI-Thread"
+_WEBUI_HOST = "0.0.0.0"
+_WEBUI_PORT = 34343
 
 # 验证令牌持久化文件（与 modules/cloudlogin.py 共用，经 mjbconfig 模块配置接口读写）
 HOPEXAUTH_FILE = "hopexauth.json"
@@ -877,17 +887,81 @@ def _create_app():
 
 
 def start_webui():
-    """启动 Flask WebUI 服务（阻塞）"""
+    """启动 Flask WebUI 服务（阻塞，可被 stop_webui 优雅停止）"""
+    global _webui_server
     app = _create_app()
     if app is None:
         return
-    logger.info("Flask WebUI服务启动在 http://127.0.0.1:34343")
     try:
-        app.run(host="0.0.0.0", port=34343, debug=False, use_reloader=False)
+        server = make_server(_WEBUI_HOST, _WEBUI_PORT, app, threaded=True)
+    except OSError as e:
+        # 端口被占用等：记录错误但不崩溃，避免影响主程序与热重载
+        logger.error(f"启动Flask WebUI服务失败: {e}")
+        return
     except Exception as e:
         logger.error(f"启动Flask WebUI服务失败: {e}")
+        return
+    with _webui_lock:
+        _webui_server = server
+    logger.info(f"Flask WebUI服务启动在 http://127.0.0.1:{_WEBUI_PORT}")
+    try:
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Flask WebUI服务运行异常: {e}")
+    finally:
+        try:
+            server.server_close()
+        except Exception as e:
+            logger.debug(f"关闭 WebUI server 句柄失败: {e}")
+        with _webui_lock:
+            if _webui_server is server:
+                _webui_server = None
+        logger.info("Flask WebUI服务已退出")
+
+
+def stop_webui():
+    """请求停止 WebUI 服务（可在非服务线程调用，使 serve_forever 自然返回）
+
+    返回 True 表示已发出停止请求；False 表示当前没有可停止的服务。
+    """
+    with _webui_lock:
+        server = _webui_server
+    if server is None:
+        logger.debug("WebUI 服务未运行，无需停止")
+        return False
+    try:
+        server.shutdown()
+        logger.info("已请求停止 WebUI 服务")
+        return True
+    except Exception as e:
+        logger.error(f"停止 WebUI 服务失败: {e}")
+        return False
+
+
+def is_webui_alive():
+    """WebUI 线程是否存活"""
+    return _webui_thread is not None and _webui_thread.is_alive()
 
 
 def start_webui_thread():
-    """在 daemon 线程中启动 Flask WebUI"""
-    worker.start_background("WebUI-Thread", start_webui, daemon=True)
+    """在 daemon 线程中启动 Flask WebUI，并登记优雅停止回调"""
+    global _webui_thread
+    t = worker.start_background(_WEBUI_THREAD_NAME, start_webui, daemon=True, stop_fn=stop_webui)
+    with _webui_lock:
+        _webui_thread = t
+    return t
+
+
+def ensure_webui_thread():
+    """确保 WebUI 线程处于运行状态（幂等）
+
+    线程存活时跳过，避免重复绑定同一端口；未存活时启动。
+    供程序启动与 mjb.reload 热重载后调用。
+    返回 True 表示本次启动了线程，False 表示已在运行未做处理。
+    """
+    if is_webui_alive():
+        logger.info("WebUI 线程已在运行，跳过重复启动")
+        return False
+    logger.info("WebUI 线程未运行，正在启动...")
+    start_webui_thread()
+    return True
