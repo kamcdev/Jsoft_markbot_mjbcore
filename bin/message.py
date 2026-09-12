@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 
 from bin import logger, mjbconfig, send, mjbc, mjbutils
+from bin import onebot_parse
 
 # 钩子注册表
 _interceptors = []          # 消息拦截器（有序）：fn(ctx) -> bool(是否已处理)
@@ -133,6 +134,7 @@ def _build_ctx(data, message_type):
         "raw_message": data.get("raw_message", ""),
         "message_id": data.get("message_id", "未知"),
         "config_data": mjbconfig.get_config(),
+        "segments": onebot_parse.parse_segments(data.get("message")),
     }
 
 
@@ -163,6 +165,12 @@ def handle_event(data):
 def handle_meta_event(data):
     """处理元事件（心跳），按账号分别更新连接状态供 WebUI 判断"""
     meta_event_type = data.get("meta_event_type", "")
+    # 统一归一化解析（lifecycle 与未知元事件也在此被记录）
+    try:
+        _ev = onebot_parse.normalize_event(data)
+        logger.debug(f"[事件] {_ev['event_name']} | {_ev['fields']}")
+    except Exception as e:
+        logger.error(f"元事件解析失败: {e}")
     if meta_event_type == "heartbeat":
         status = data.get("status", {})
         interval = data.get("interval", 0)
@@ -228,7 +236,14 @@ def handle_request(data):
     """处理请求事件（好友申请/加群申请），复用 notice 处理器机制"""
     request_type = data.get("request_type", "未知")
     logger.debug(f"请求事件 {request_type}")
-    handlers = _notice_handlers.get(request_type, [])
+    # 统一归一化解析并记录（零侵入，仅新增日志）
+    try:
+        _ev = onebot_parse.normalize_event(data)
+        logger.info(f"[事件] {_ev['event_name']} | {_ev['fields']}")
+    except Exception as e:
+        logger.error(f"请求解析失败: {e}")
+    # 双键查找：request_type(friend/group) 或 f"{request_type}_request"(friend_request/group_request)
+    handlers = _notice_handlers.get(request_type, []) or _notice_handlers.get(f"{request_type}_request", [])
     for fn in handlers:
         try:
             fn(data)
@@ -346,6 +361,12 @@ def handle_notice(data):
     notice_type = data.get("notice_type", "未知")
     group_id = data.get("group_id")
     logger.debug(f"通知事件 {notice_type} 群{group_id}")
+    # 统一归一化解析并记录（零侵入，仅新增日志；未注册事件也不再静默丢弃）
+    try:
+        _ev = onebot_parse.normalize_event(data)
+        logger.info(f"[事件] {_ev['event_name']} 群{group_id} | {_ev['fields']}")
+    except Exception as e:
+        logger.error(f"通知解析失败: {e}")
     handlers = _notice_handlers.get(notice_type, [])
     for fn in handlers:
         try:
