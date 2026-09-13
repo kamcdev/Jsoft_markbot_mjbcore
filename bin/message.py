@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import datetime
 
-from bin import logger, mjbconfig, send, mjbc, mjbutils
+from bin import logger, mjbconfig, send, mjbc, mjbutils, worker
 from bin import onebot_parse
 
 # 钩子注册表
@@ -186,28 +186,28 @@ def handle_meta_event(data):
         logger.debug(f"心跳事件[{key}]: online={info_entry['online']}, interval={interval}ms")
 
 
-def _expire_heartbeat(info):
-    """对单个心跳副本做超时检测
+def _expire_heartbeat(info, bot_id=None):
+    """对单个账号在线状态副本做超时检测
 
-    超时阈值按账号心跳间隔动态计算：max(5, interval*2 + 5) 秒，
-    避免多账号心跳上报时刻错开时被误判为 offline。
-    interval 为 OneBot 协议字段，单位毫秒。
+    heartbeat 模式：等待心跳包的超时时间由全局 heart_patience 决定；
+    api 模式：不依赖心跳包，由轮询线程主动更新（此处不做超时判定）。
     """
+    if bot_id is not None and mjbconfig.get_online_check(bot_id) == "api":
+        return info  # api 轮询方案由轮询线程维护，超时由请求本身体现
     ts = info.get("timestamp", 0)
     if ts <= 0:
         info["online"] = False
         return info
-    interval_ms = info.get("interval", 0) or 0
-    threshold = max(5.0, interval_ms * 2 / 1000.0 + 5.0)
+    threshold = mjbconfig.get_heart_patience()
     if (datetime.now().timestamp() - ts) >= threshold:
         info["online"] = False
     return info
 
 
 def get_heartbeat_info(bot_id=None):
-    """获取指定账号心跳副本（带动态超时检测）
+    """获取指定账号在线状态副本（带超时检测）
 
-    bot_id 为 None 时返回默认账号心跳（向后兼容旧调用）。
+    bot_id 为 None 时返回默认账号状态（向后兼容旧调用）。
     """
     if bot_id is None:
         bot_id = mjbconfig.get_default_bot_id()
@@ -216,11 +216,11 @@ def get_heartbeat_info(bot_id=None):
         info = info.copy() if info else {}
     if not info:
         info = {"online": False, "interval": 0, "timestamp": 0, "raw_status": {}}
-    return _expire_heartbeat(info)
+    return _expire_heartbeat(info, bot_id)
 
 
 def get_all_heartbeat_info():
-    """获取所有账号心跳副本（带 5 秒超时检测）
+    """获取所有账号在线状态副本（带超时检测）
 
     Returns:
         dict: {bot_id: info}（key 为字符串账号 ID；可能包含 None 键）
@@ -228,8 +228,87 @@ def get_all_heartbeat_info():
     with _heartbeat_lock:
         snapshot = {k: v.copy() for k, v in _heartbeat_info.items()}
     for k, v in snapshot.items():
-        _expire_heartbeat(v)
+        _expire_heartbeat(v, k)
     return snapshot
+
+
+# ===================== api 轮询方案（online_check == "api"） =====================
+_ONLINE_POLL_NAME = "online-check-poll"
+_online_poll_stop = threading.Event()
+_online_poll_thread = None
+_online_poll_lock = threading.Lock()
+
+
+def _poll_api_status(bot_id, patience):
+    """对单个 api 模式账号请求 get_status 并写入在线状态副本（单次请求超时 = heart_patience）"""
+    key = str(bot_id)
+    try:
+        resp = send._post("get_status", bot_id=bot_id, json={}, timeout=float(patience))
+        try:
+            result = resp.json()
+        except Exception:
+            result = None
+    except Exception as e:
+        logger.warning(f"账号[{key}] get_status 轮询失败: {e}")
+        result = None
+    data = result.get("data", {}) if isinstance(result, dict) else {}
+    online = bool(data.get("online", False)) if isinstance(data, dict) else False
+    info_entry = {
+        "online": online,
+        "interval": 0,
+        "timestamp": time.time(),
+        "raw_status": result if isinstance(result, dict) else {},
+        "api": True,
+    }
+    with _heartbeat_lock:
+        _heartbeat_info[key] = info_entry
+
+
+def _online_check_poll_loop(stop_event):
+    """api 模式账号在线状态轮询线程主循环
+
+    每隔 heart_patience 秒，对所有 online_check == "api" 的账号请求 get_status，
+    单次请求超时时间同为 heart_patience。
+    """
+    while not stop_event.is_set():
+        patience = mjbconfig.get_heart_patience()
+        for bid in mjbconfig.get_account_list():
+            if stop_event.is_set():
+                return
+            if mjbconfig.get_online_check(bid) == "api":
+                _poll_api_status(bid, patience)
+        stop_event.wait(patience)
+
+
+def start_online_check_polling():
+    """启动 api 模式账号的在线状态轮询线程（若存在任一 api 账号）
+
+    幂等：已在运行则跳过；无 api 账号则不启动。供程序启动与 mjb.reload 后调用。
+    """
+    global _online_poll_thread
+    needs_poll = any(mjbconfig.get_online_check(b) == "api" for b in mjbconfig.get_account_list())
+    if not needs_poll:
+        return False
+    with _online_poll_lock:
+        if _online_poll_thread is not None and _online_poll_thread.is_alive():
+            return False
+        _online_poll_stop.clear()
+        t = worker.start_background(
+            _ONLINE_POLL_NAME, _online_check_poll_loop,
+            stop_event=_online_poll_stop, stop_attr=None,
+        )
+        _online_poll_thread = t
+    logger.info("已启动 api 在线状态轮询线程")
+    return True
+
+
+def stop_online_check_polling():
+    """停止 api 在线状态轮询线程"""
+    global _online_poll_thread
+    with _online_poll_lock:
+        _online_poll_stop.set()
+        _online_poll_thread = None
+    worker.stop_background(_ONLINE_POLL_NAME)
 
 
 def handle_request(data):

@@ -288,6 +288,27 @@ function refreshStatus() {
             // - 其它：至少有一个账号在线
             const hasValidHeartbeat = data.success && data.data && totalCount > 0 && onlineCount > 0;
 
+            // 非法 online_check 配置优先：仍显示在线样式，但 Bot 状态提示配置异常
+            if (data.success && hb.status_error) {
+                lastHeartbeatTime = new Date();
+                if (isConnectionError) {
+                    restoreNormalStatus();
+                }
+                statusIndicator.style.backgroundColor = '#4CAF50';
+                document.getElementById('bot-status').textContent = '无法获取，请注意配置';
+                document.getElementById('thread-count').textContent = data.data.thread_count;
+                document.getElementById('uptime').textContent = data.data.uptime;
+
+                // 更新CPU和内存占用
+                if (data.data.cpu_usage !== undefined) {
+                    document.getElementById('cpu-usage').textContent = data.data.cpu_usage;
+                }
+                if (data.data.memory_usage !== undefined) {
+                    document.getElementById('memory-usage').textContent = data.data.memory_usage;
+                }
+                return;  // 其它信息正常展示，跳过下方常规逻辑
+            }
+
             if (hasValidHeartbeat) {
                 // 更新最后一次心跳回传时间
                 lastHeartbeatTime = new Date();

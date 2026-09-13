@@ -250,6 +250,8 @@ def _create_app():
                 "offline_count": offline_count,
                 "total_count": total_count,
                 "accounts": accounts_status,
+                # 是否存在非法 online_check 配置（值既非 heartbeat 也非 api）
+                "status_error": mjbconfig.has_invalid_online_check(),
                 # 兼容旧字段
                 "interval": default_heartbeat.get("interval", 0),
                 "timestamp": default_heartbeat.get("timestamp", 0),

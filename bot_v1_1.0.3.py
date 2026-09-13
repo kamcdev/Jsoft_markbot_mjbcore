@@ -267,6 +267,12 @@ def reload_all():
     logger.info("reload: 确保 WebUI 线程运行...")
     webmain.ensure_webui_thread()
 
+    # 9. 重启 api 在线状态轮询线程（热重载已停止所有后台线程；存在 api 账号时重开）
+    try:
+        message.start_online_check_polling()
+    except Exception as e:
+        logger.error(f"reload: 重启 api 在线状态轮询失败: {e}")
+
     logger.info("reload: 重载完成")
 
 
@@ -300,6 +306,12 @@ def start():
 
     # 注册 reload 回调（供 mjb.reload 命令调用）
     mjbc.set_reload_callback(reload_all)
+
+    # 启动 api 在线状态轮询线程（存在 online_check=="api" 账号时）
+    try:
+        message.start_online_check_polling()
+    except Exception as e:
+        logger.error(f"启动 api 在线状态轮询失败: {e}")
 
     accounts = mjbconfig.get_account_list()
     if accounts:

@@ -207,9 +207,18 @@ def _norm_token(value):
     return token or None
 
 
+def _norm_online_check(value):
+    """规范化 online_check：去除首尾空白并转小写；空串返回 "heartbeat"（默认）。
+    返回原值可能为非法值（非 heartbeat/api），由 has_invalid_online_check 检测。"""
+    if value is None:
+        return "heartbeat"
+    v = str(value).strip().lower()
+    return v or "heartbeat"
+
+
 def load_accounts():
     """读取 coreset 配置的 account 键（coreset.json，kadset 兜底），
-    格式 {QQ: {webhook_port, send_port, webhook_token, send_token}}"""
+    格式 {QQ: {webhook_port, send_port, webhook_token, send_token, online_check}}"""
     global _accounts
     _accounts = {}
     _load_coreset()
@@ -223,6 +232,7 @@ def load_accounts():
                 "send_port": int(ports.get("send_port", _DEFAULT_SEND_PORT)),
                 "webhook_token": _norm_token(ports.get("webhook_token")),
                 "send_token": _norm_token(ports.get("send_token")),
+                "online_check": _norm_online_check(ports.get("online_check")),
             }
     if not _accounts:
         # 回退：从 config/ 目录自动发现账号
@@ -243,11 +253,12 @@ def _discover_accounts_from_config_dir():
                     "send_port": _DEFAULT_SEND_PORT,
                     "webhook_token": None,
                     "send_token": None,
+                    "online_check": "heartbeat",
                 }
 
 
 def get_accounts():
-    """返回账号列表 dict：{bot_id: {"webhook_port": int, "send_port": int, "webhook_token": str|None, "send_token": str|None}}"""
+    """返回账号列表 dict：{bot_id: {"webhook_port", "send_port", "webhook_token", "send_token", "online_check"}}"""
     if not _accounts:
         load_accounts()
     return dict(_accounts)
@@ -451,6 +462,49 @@ def get_send_token(bot_id=None):
         return None
     acc = get_accounts().get(str(resolved), {})
     return acc.get("send_token") if isinstance(acc, dict) else None
+
+
+def get_online_check(bot_id=None):
+    """读取账号的在线状态检查方案（coreset.account 配置）
+
+    - "heartbeat"（默认）：等待该账号上报的心跳包判断在线
+    - "api"：不等待心跳，主动请求 get_status 接口轮询判断在线
+    - 其它值：非法配置，由 has_invalid_online_check() 判定
+    """
+    resolved = _resolve_bot_id(bot_id)
+    if not resolved:
+        return "heartbeat"
+    acc = get_accounts().get(str(resolved), {})
+    v = acc.get("online_check", "heartbeat") if isinstance(acc, dict) else "heartbeat"
+    return v or "heartbeat"
+
+
+def has_invalid_online_check():
+    """是否存在非法 online_check 配置（值既非 heartbeat 也非 api）
+
+    只要任意一个账号配置了超出 heartbeat/api 之外的类型，返回 True，
+    WebUI 将据此将 Bot 状态显示为"无法获取，请注意配置"。
+    """
+    for bid in get_account_list():
+        acc = get_accounts().get(bid, {})
+        v = acc.get("online_check") if isinstance(acc, dict) else "heartbeat"
+        if v not in ("heartbeat", "api"):
+            return True
+    return False
+
+
+def get_heart_patience(default=5):
+    """全局在线状态检查周期/超时（coreset 的 heart_patience 键，单位秒，默认 5）
+
+    - heartbeat 模式：等待心跳包的超时时间
+    - api 模式：每多少秒轮询一次 get_status（单次请求超时同为该值）
+    """
+    raw = get_coreset("heart_patience", default)
+    try:
+        val = float(raw)
+        return val if val > 0 else float(default)
+    except (TypeError, ValueError):
+        return float(default)
 
 
 # ===================== 通用 getter（按当前账号状态读取，签名向后兼容） =====================
