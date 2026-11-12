@@ -2,9 +2,10 @@
 import re
 import time
 import random
+import threading
 from datetime import datetime
 
-from bin import send, logger, mjbconfig, mjbutils, worker, message
+from pymjb import send, logger, mjbconfig, mjbutils, worker, message
 
 # 模块级状态：待验证用户信息
 # {"group_id": {"user_id": {"answer": 答案, "question": "问题", "attempts": 尝试次数, "timeout": 超时时间戳}}}
@@ -114,14 +115,19 @@ class AuthThread:
 
 
 class FriendRequestThread:
-    """好友申请自动处理线程（可调用对象，通过 worker.start_background 启动）"""
+    """好友申请自动处理线程（可调用对象，通过 worker.start_background 启动）
+
+    使用可中断事件替代 time.sleep 长阻塞：stop() 置位事件后，正在等待的循环会立即
+    返回，使热重载时线程能在 worker 的 join 超时前自行退出，无需强制终止。
+    """
 
     def __init__(self):
         self.running = True
+        self._stop_event = threading.Event()
 
     def __call__(self):
         logger.info("好友申请自动处理线程已启动")
-        while self.running:
+        while self.running and not self._stop_event.is_set():
             # 这里我们主要依靠HTTP回调来处理实时的好友申请
             # 此线程可以用于检查被过滤的好友请求（如果API支持）
             try:
@@ -143,10 +149,15 @@ class FriendRequestThread:
             except Exception:
                 # 静默处理异常，避免线程崩溃
                 pass
-            time.sleep(30)  # 每30秒检查一次被过滤的好友请求
+            # 每30秒检查一次被过滤的好友请求（等待期间可被 stop() 立即唤醒）
+            if self._stop_event.wait(30):
+                break
+        logger.info("好友申请自动处理线程已退出")
 
     def stop(self):
         self.running = False
+        self._stop_event.set()
+        logger.info("好友申请自动处理线程: 已停止运行")
 
 
 # ===================== 消息拦截器 =====================

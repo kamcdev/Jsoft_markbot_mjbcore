@@ -3,7 +3,7 @@ import os
 import platform
 import psutil
 
-from bin import logger, mjbconfig
+from pymjb import logger, mjbconfig
 
 
 def generate():

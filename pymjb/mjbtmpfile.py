@@ -3,7 +3,7 @@ import os
 import time
 import tempfile
 
-from bin import logger, worker
+from pymjb import logger, worker
 
 
 def create(suffix="", prefix="mjb_", dir=None):

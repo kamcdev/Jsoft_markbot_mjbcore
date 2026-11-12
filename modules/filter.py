@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import re
 
-from bin import send, logger, mjbconfig, mjbutils, message
+from pymjb import send, logger, mjbconfig, mjbutils, message
 
 
 def modcfg():

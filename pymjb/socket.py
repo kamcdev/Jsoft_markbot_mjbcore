@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from bin import logger, mjbconfig, message, worker
+from pymjb import logger, mjbconfig, message, worker
 
 # 按账号缓存的 FastAPI 应用：bot_id(str) -> app；None 键保留给旧默认（无账号场景）
 _apps = {}

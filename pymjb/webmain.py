@@ -12,7 +12,7 @@ import ipaddress
 from flask import Flask, request, jsonify, send_from_directory, make_response
 from werkzeug.serving import make_server
 
-from bin import logger, mjbconfig, mjbstatus, worker, message
+from pymjb import logger, mjbconfig, mjbstatus, worker, message
 
 _webui_app = None
 _start_time = time.time()

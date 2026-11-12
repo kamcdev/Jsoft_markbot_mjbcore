@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import re
 
-from bin import logger
+from pymjb import logger
 
 
 def extract_qq_from_at(at_str):

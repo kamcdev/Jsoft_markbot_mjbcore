@@ -4,9 +4,9 @@ import json
 import re
 import threading
 
-from bin import logger, kadset
+from pymjb import logger, kadset
 
-_MJBC_VER_RAW = "mjb-1.0.3.11(157)"
+_MJBC_VER_RAW = "mjb-1.0.4(165)"
 
 
 def get_mjbcver_raw():
@@ -133,7 +133,7 @@ def get_bot_path(default=None):
     """读取全局 bot 根目录路径（coreset 的 bot_path 键）"""
     return get_coreset("bot_path", default)
 
-# ---- 运行时状态：每账号独立（config/<bot_id>/group.json）----
+# ---- 运行时状态：每账号独立（config/<bot_id>/main/group.json）----
 _account_states = {}  # bot_id(str) -> state dict（见 _new_state）
 
 # 模块重载钩子（全局共享）
@@ -246,7 +246,9 @@ def _discover_accounts_from_config_dir():
         return
     for name in sorted(os.listdir(_CONFIG_DIR)):
         full = os.path.join(_CONFIG_DIR, name)
-        if os.path.isdir(full) and name != "modcfg" and _config_file_exists(os.path.join(full, "group.json")):
+        if os.path.isdir(full) and name != "modcfg" and _config_file_exists(
+            os.path.join(full, "main", "group.json")
+        ):
             if name not in _accounts:
                 _accounts[name] = {
                     "webhook_port": _DEFAULT_WEBHOOK_PORT,
@@ -367,8 +369,13 @@ def _account_dir(bot_id):
     return os.path.join(_CONFIG_DIR, str(bot_id))
 
 
+def _main_dir(bot_id):
+    """账号主配置目录 config/<bot_id>/main/（group/gpauths/banuser/gpevent）"""
+    return os.path.join(_account_dir(bot_id), "main")
+
+
 def _group_file(bot_id):
-    return os.path.join(_account_dir(bot_id), "group.json")
+    return os.path.join(_main_dir(bot_id), "group.json")
 
 
 def _modcfg_dir(bot_id):
@@ -376,7 +383,8 @@ def _modcfg_dir(bot_id):
 
 
 def _core_config_file(bot_id, name):
-    return os.path.join(_account_dir(bot_id), name)
+    """账号核心配置路径（统一位于 config/<bot_id>/main/ 下）"""
+    return os.path.join(_main_dir(bot_id), name)
 
 
 # ===================== 端口与 API 地址 =====================
@@ -792,7 +800,7 @@ def _reload_account(bot_id):
 
             # 在主群发送重载提示（延迟导入 send 避免循环依赖）
             try:
-                from bin import send
+                from pymjb import send
                 if state["target_group"] and state["target_group"] != "0":
                     send.group(state["target_group"], "配置文件已自动重载")
             except Exception as e:
@@ -1046,7 +1054,7 @@ def save_module_config(name, data, bot_id=None):
         return False
 
 
-# ===================== 核心配置（config/<bot_id>/） =====================
+# ===================== 核心配置（config/<bot_id>/main/） =====================
 def load_banuser(bot_id=None):
     """读取黑名单 banuser.json（json 优先，kadset 兜底）-> {"banned_users": {...}}"""
     resolved = _resolve_bot_id(bot_id)

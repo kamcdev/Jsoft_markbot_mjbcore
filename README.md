@@ -89,7 +89,7 @@ pip install -r requirements.txt
 使用命令
 
 ```
-python bot_v1_1.0.3.py
+python bot.py
 ```
 
 启动bot程序

@@ -97,7 +97,7 @@ def _detect_source_name():
 def _get_current_account():
     """获取当前线程的账号 bot_id（惰性导入 + 静默兜底，防循环导入与启动早期异常）"""
     try:
-        from bin import mjbconfig as _m
+        from pymjb import mjbconfig as _m
         return _m.get_current_bot_id()
     except Exception:
         return None
@@ -169,7 +169,7 @@ def _setup_file_logging():
     if _file_handler is not None:
         return True
     try:
-        from bin import mjbconfig as _m
+        from pymjb import mjbconfig as _m
         if not _m.get_coreset("log_output", False):
             return False
     except Exception:
@@ -236,7 +236,7 @@ class _GroupErrorHandler(logging.Handler):
             return
         try:
             # 延迟导入避免循环依赖（send 依赖 logger）
-            from bin import send as _send, mjbconfig as _cfg
+            from pymjb import send as _send, mjbconfig as _cfg
             target_group = _cfg.get_target_group()
             if not target_group or target_group == "0":
                 return
@@ -271,7 +271,7 @@ def _forward_traceback(exc_type, exc_value, exc_tb):
     if not _notify_enabled or _sending:
         return
     try:
-        from bin import send as _send, mjbconfig as _cfg
+        from pymjb import send as _send, mjbconfig as _cfg
         target_group = _cfg.get_target_group()
         if not target_group or target_group == "0":
             return

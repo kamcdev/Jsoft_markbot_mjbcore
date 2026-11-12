@@ -2,7 +2,7 @@
 import os
 import requests
 
-from bin import logger, mjbconfig
+from pymjb import logger, mjbconfig
 
 
 def _resolve_bot(bot_id=None, group_id=None):

@@ -5,8 +5,8 @@ import threading
 import time
 from datetime import datetime
 
-from bin import logger, mjbconfig, send, mjbc, mjbutils, worker
-from bin import onebot_parse
+from pymjb import logger, mjbconfig, send, mjbc, mjbutils, worker
+from pymjb import onebot_parse
 
 # 钩子注册表
 _interceptors = []          # 消息拦截器（有序）：fn(ctx) -> bool(是否已处理)

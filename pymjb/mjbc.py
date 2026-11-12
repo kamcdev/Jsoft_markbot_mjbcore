@@ -3,7 +3,7 @@ import os
 import json
 import random
 
-from bin import logger, mjbconfig, send, mjbmenu, mjbstatus, mjbutils, mjbtmpfile, worker
+from pymjb import logger, mjbconfig, send, mjbmenu, mjbstatus, mjbutils, mjbtmpfile, worker
 
 # 命令分发表：func_name -> 可调用对象
 command_functions = {}

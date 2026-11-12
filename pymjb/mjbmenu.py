@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import html as _html
 
-from bin import mjbconfig
+from pymjb import mjbconfig
 
 
 def _build_copyright():

@@ -8,7 +8,19 @@ import importlib
 import subprocess
 import traceback
 
-from bin import logger, mjbconfig, send, worker, message, mjbc, socket, webmain
+# 项目根目录加入 sys.path，保证 crashhandler 可导入（含编译为 pyd 的场景）
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+# 崩溃守护引导：必须在其余组件导入之前执行
+# coreset.use_crashhandler 开启且当前进程未被守护时，本进程转为守护父进程并拉起工作进程
+import crashhandler
+
+if __name__ == "__main__":
+    crashhandler.bootstrap(__file__)
+
+from pymjb import logger, mjbconfig, send, worker, message, mjbc, socket, webmain
 
 
 # 模块根目录与包名（用于 importlib 导入 modules.<name>）
@@ -230,7 +242,7 @@ def reload_all():
     7. 重新自检通知
     8. 确保 WebUI 线程运行
     """
-    import bin.message as _message
+    import pymjb.message as _message
 
     # 1. 停止所有后台线程并等待退出（确保旧线程彻底销毁后再创建新线程）
     logger.info("reload: 停止后台线程...")
@@ -353,7 +365,13 @@ def _send_startup_notice():
             mjbconfig.clear_current_bot_id()
 
 
-if __name__ == "__main__":
+def _main():
+    """主流程：初始化内核 → 加载模块 → 启动服务"""
     init()
     load_modules()
     start()
+
+
+if __name__ == "__main__":
+    # 受守护时由 crashhandler 包住主流程：未捕获异常落盘为 crash 报告并由父进程重启
+    crashhandler.run_guarded(_main)

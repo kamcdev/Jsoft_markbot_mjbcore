@@ -4,7 +4,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from bin import logger, mjbconfig
+from pymjb import logger, mjbconfig
 
 # 命令执行线程池
 _executor = None
