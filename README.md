@@ -1,3 +1,6 @@
+> [!WARNING]
+> 1.0.4的api更新仍在逐步进行，更新并不稳定，可能随时有较大修改，在完成api更新前，推荐继续使用1.0.3系列版本
+
 ### Jsoft_markbot_mjbcore
 
  <img src="https://www.jsoftstudio.top/css/Jsoft_logo.png" width = "100" height = "100" alt="Jsoft_logo" align=center />

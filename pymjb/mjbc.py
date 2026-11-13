@@ -8,49 +8,114 @@ from pymjb import logger, mjbconfig, send, mjbmenu, mjbstatus, mjbutils, mjbtmpf
 # 命令分发表：func_name -> 可调用对象
 command_functions = {}
 
+# 命令归属表：func_name -> 模块名（注册时的模块上下文）
+# 供单模块重载（mjb.reload mod）只清理该模块的命令，内置命令无归属
+_command_owners = {}
+
+
+def _record_owner(names):
+    """记录命令归属（仅在模块上下文中注册时记录）"""
+    module_name = worker.get_module_context()
+    if not module_name:
+        return
+    for name in names:
+        _command_owners[name] = module_name
+
 
 def register_command(func_name, func):
     """注册单个命令函数，支持顶替内置命令，插件注册同名函数（如 cmd_autogpwel）会覆盖内置命令函数，优先级大于内置"""
-    command_functions[func_name] = func
+    names = [func_name]
     if func_name.startswith("cmd_"):
         short = func_name[4:]
         if short:
-            command_functions[short] = func
+            names.append(short)
     else:
-        command_functions[f"cmd_{func_name}"] = func
+        names.append(f"cmd_{func_name}")
+    for name in names:
+        command_functions[name] = func
+    _record_owner(names)
     logger.debug(f"已注册命令函数: {func_name}")
 
 
 def register_commands(mapping):
     """批量注册命令函数 {func_name: func}（同 register_command 的双名注册语义）"""
     for func_name, func in mapping.items():
-        command_functions[func_name] = func
+        names = [func_name]
         if func_name.startswith("cmd_"):
             short = func_name[4:]
             if short:
-                command_functions[short] = func
+                names.append(short)
         else:
-            command_functions[f"cmd_{func_name}"] = func
+            names.append(f"cmd_{func_name}")
+        for name in names:
+            command_functions[name] = func
+        _record_owner(names)
+
+
+def _restore_builtin(name):
+    """若 name 对应内置命令，恢复其内置实现；返回是否已恢复"""
+    short = name[4:] if name.startswith("cmd_") else name
+    builtin = _builtin_commands.get(short)
+    if builtin is None:
+        return False
+    command_functions[name] = builtin
+    return True
 
 
 def clear_commands():
-    """清空所有已注册命令（供 mjb.reload 使用，保留内置命令）"""
+    """清空所有已注册命令（供 mjb.reload all 使用，保留内置命令）"""
     # 保留 _builtin_commands 中的内置命令
     builtin_names = set(_builtin_commands.keys()) | {f"cmd_{k}" for k in _builtin_commands}
     to_remove = [name for name in command_functions if name not in builtin_names]
     for name in to_remove:
         del command_functions[name]
+    # 归属表中非内置项一并清空
+    for name in [n for n in _command_owners if n not in builtin_names]:
+        _command_owners.pop(name, None)
     logger.debug(f"已清除 {len(to_remove)} 个非内置命令")
 
 
+def clear_module_commands(module_name):
+    """只清理指定模块注册的命令（供 mjb.reload mod 使用）
+
+    若某个名字原本是内置命令（被该模块顶替），则恢复内置实现。
+
+    Returns:
+        清理的命令名数量
+    """
+    if not module_name:
+        return 0
+    names = [n for n, owner in list(_command_owners.items()) if owner == module_name]
+    for name in names:
+        _command_owners.pop(name, None)
+        if not _restore_builtin(name):
+            command_functions.pop(name, None)
+    if names:
+        logger.info(f"模块 [{module_name}] 已清理 {len(names)} 个命令函数")
+    return len(names)
+
+
 # reload 回调（由编排层注册，cmd_reload 执行时调用）
-_reload_callback = None
+_reload_callback = None        # all：完整重载
+_load_new_callback = None      # new：加载新增但未载入的模块
+_reload_mod_callback = None    # mod：单模块重载
 
 
-def set_reload_callback(fn):
-    """注册 reload 回调函数（由编排层调用）"""
-    global _reload_callback
-    _reload_callback = fn
+def set_reload_callback(fn=None, load_new=None, reload_mod=None):
+    """注册 reload 相关回调函数（由编排层调用）
+
+    Args:
+        fn: 完整重载回调（mjb.reload all）
+        load_new: 加载新模块回调（mjb.reload new），返回 (ok, message)
+        reload_mod: 单模块重载回调（mjb.reload mod <模块名>），入参模块名，返回 (ok, message)
+    """
+    global _reload_callback, _load_new_callback, _reload_mod_callback
+    if fn is not None:
+        _reload_callback = fn
+    if load_new is not None:
+        _load_new_callback = load_new
+    if reload_mod is not None:
+        _reload_mod_callback = reload_mod
 
 
 def get_command_functions():
@@ -195,8 +260,110 @@ def _render_help_image(group_id, showhidden, is_bot_admin, is_group_admin):
 
 
 # ===================== 内置核心命令 =====================
+def _help_data_of(mod_meta):
+    """从模块元信息（modcfg 返回值）中取出结构合法的 help 字典，非法时返回空字典"""
+    if not isinstance(mod_meta, dict):
+        return {}
+    help_data = mod_meta.get("help")
+    if not isinstance(help_data, dict):
+        return {}
+    return help_data
+
+
+def _help_sort_key(index):
+    """help 序号排序键：数字序号按数值升序在前，非数字序号按原顺序排在后面"""
+    try:
+        return (0, int(str(index).strip()))
+    except (TypeError, ValueError):
+        return (1, 0)
+
+
+def _format_help_command(cmd_name, entries):
+    """把一条命令的 {序号: {parameter, annotation}} 渲染成若干行文本（不含编号）"""
+    if not isinstance(entries, dict):
+        return []
+    lines = []
+    for index in sorted(entries.keys(), key=_help_sort_key):
+        item = entries.get(index)
+        if not isinstance(item, dict):
+            continue
+        params = item.get("parameter") or []
+        if isinstance(params, str):
+            params = [params]
+        elif not isinstance(params, (list, tuple)):
+            params = [params]
+        param_text = " ".join(str(p).strip() for p in params if str(p).strip())
+        text = f"{cmd_name} {param_text}" if param_text else str(cmd_name)
+        annotation = str(item.get("annotation") or "").strip()
+        lines.append(f"{text} — {annotation}" if annotation else text)
+    return lines
+
+
+def _render_usage(lines):
+    """把若干行帮助渲染成子菜单文本（统一从 1 开始编号）"""
+    if not lines:
+        return ""
+    numbered = "\n".join(f"{i}. {line}" for i, line in enumerate(lines, 1))
+    return f"用法：\n{numbered}"
+
+
+def _build_sub_help(query):
+    """在所有已载入模块的 modcfg.help 中检索 query，返回子菜单文本
+
+    匹配顺序：命令注册名（跨模块）优先，其次模块名（忽略大小写）。
+    """
+    query = (query or "").strip()
+    if not query:
+        return "该模块未提供子菜单"
+
+    help_map = {}
+    for mod_name, mod_meta in _collect_loaded_modules().items():
+        data = _help_data_of(mod_meta)
+        if data:
+            help_map[mod_name] = data
+    if not help_map:
+        return "该模块未提供子菜单"
+
+    # 1) 命令注册名精确匹配：命中的命令可能分布在多个模块
+    lines = []
+    for mod_name in sorted(help_map):
+        data = help_map[mod_name]
+        if query in data:
+            lines.extend(_format_help_command(query, data[query]))
+    if lines:
+        return _render_usage(lines)
+
+    # 2) 模块名匹配：输出该模块 help 中的全部命令
+    target = help_map.get(query)
+    if target is None:
+        lower = query.lower()
+        for mod_name in sorted(help_map):
+            if mod_name.lower() == lower:
+                target = help_map[mod_name]
+                break
+    if target:
+        for cmd_name, entries in target.items():
+            lines.extend(_format_help_command(cmd_name, entries))
+    if lines:
+        return _render_usage(lines)
+
+    return "该模块未提供子菜单"
+
+
 def cmd_help(group_id, user_id, config_data, *args):
-    """显示帮助信息，根据用户权限显示不同命令列表"""
+    """显示帮助信息，根据用户权限显示不同命令列表
+
+    用法：
+    - help                 - 总帮助（图片或文字，按配置）
+    - help <模块名|命令名>  - 该模块/该命令的子菜单（取自各模块 modcfg 的 help 字段）
+    - help -h / -H         - 强制文字总帮助
+    """
+    # help <模块名|命令注册名>：发送子菜单
+    if args and not str(args[0]).startswith("-"):
+        msg = _build_sub_help(str(args[0]))
+        send.group(group_id, msg)
+        return "已发送子菜单帮助"
+
     showhidden = len(args) > 0 and args[0] == "-showhidden"
     onimagehelp = mjbconfig.get_onimagehelp()
 
@@ -276,31 +443,101 @@ def cmd_reboot(group_id, user_id, config_data, *args):
         return f"重启失败: {e}"
 
 
+def _unpack_reload_result(result, default_msg):
+    """统一解析回调返回值：兼容 None/str/(ok, msg)"""
+    if isinstance(result, tuple) and len(result) >= 2:
+        return bool(result[0]), str(result[1])
+    if isinstance(result, str) and result.strip():
+        return True, result.strip()
+    return True, default_msg
+
+
 def cmd_reload(group_id, user_id, config_data, *args):
     """重载模块但不重启程序（仅Bot管理员）
 
-    执行后会阻塞主线程，卸载所有模块/配置/命令并重新加载，然后重新自检并加载配置。
+    用法：
+    - mjb.reload all        - 完整重载（停止全部后台线程、清空钩子与命令后重新加载）
+    - mjb.reload new        - 加载模块目录中新增但尚未载入的模块
+    - mjb.reload mod <模块名> - 只重载指定模块（结束该模块线程、卸载、重新载入并初始化）
     """
     admin_list = mjbutils.get_admin_list_from_config(config_data)
     if str(user_id) not in admin_list:
         send.group(group_id, "权限不足，仅Bot管理员可重载")
         return "权限不足"
 
-    if _reload_callback is None:
-        send.group(group_id, "重载功能未就绪，无法执行")
-        return "reload 回调未注册"
+    if not args:
+        send.group(group_id, """用法:
+1. mjb.reload all - 完整重载所有模块与配置（停止全部后台线程后重新加载，不重启程序）
+2. mjb.reload new - 加载模块目录中新增但尚未载入的模块
+3. mjb.reload mod <模块名> - 重载指定模块（如 mjb.reload mod bilibili）
+模块名列表可用 mjb.mod list 查看""")
+        return "缺少参数"
 
-    send.group(group_id, "正在重载模块...")
-    logger.warning("收到重载命令，开始卸载并重新加载模块")
+    sub = str(args[0]).strip().lower()
 
-    try:
-        _reload_callback()
-        send.group(group_id, "模块与配置重载完成")
-        return "重载完成"
-    except Exception as e:
-        logger.error(f"重载失败: {e}")
-        send.group(group_id, f"重载失败: {e}")
-        return f"重载失败: {e}"
+    if sub == "all":
+        if _reload_callback is None:
+            send.group(group_id, "重载功能未就绪，无法执行")
+            return "reload 回调未注册"
+        send.group(group_id, "正在完整重载模块与配置...")
+        logger.warning("收到重载命令（all），开始卸载并重新加载全部模块")
+        try:
+            ok, msg = _unpack_reload_result(_reload_callback(), "模块与配置重载完成")
+        except Exception as e:
+            logger.error(f"重载失败: {e}")
+            send.group(group_id, f"重载失败: {e}")
+            return f"重载失败: {e}"
+        send.group(group_id, msg)
+        return msg
+
+    if sub == "new":
+        if _load_new_callback is None:
+            send.group(group_id, "加载新模块功能未就绪，无法执行")
+            return "load_new 回调未注册"
+        send.group(group_id, "正在检查并加载新模块...")
+        logger.warning("收到重载命令（new），开始加载新增模块")
+        try:
+            ok, msg = _unpack_reload_result(_load_new_callback(), "新模块加载完成")
+        except Exception as e:
+            logger.error(f"加载新模块失败: {e}")
+            send.group(group_id, f"加载新模块失败: {e}")
+            return f"加载新模块失败: {e}"
+        send.group(group_id, msg)
+        return msg
+
+    if sub == "mod":
+        if _reload_mod_callback is None:
+            send.group(group_id, "单模块重载功能未就绪，无法执行")
+            return "reload_mod 回调未注册"
+        if len(args) < 2 or not str(args[1]).strip():
+            send.group(group_id, """模块名错误，请提供要重载的模块名
+
+用法:
+1. mjb.reload all - 完整重载所有模块与配置（停止全部后台线程后重新加载，不重启程序）
+2. mjb.reload new - 加载模块目录中新增但尚未载入的模块
+3. mjb.reload mod <模块名> - 重载指定模块（如 mjb.reload mod bilibili）
+模块名列表可用 mjb.mod list 查看""")
+            return "模块名错误"
+        mod_name = str(args[1]).strip()
+        send.group(group_id, f"正在重载模块 {mod_name}...")
+        logger.warning(f"收到重载命令（mod），目标模块: {mod_name}")
+        try:
+            ok, msg = _unpack_reload_result(_reload_mod_callback(mod_name), f"模块 {mod_name} 重载完成")
+        except Exception as e:
+            logger.error(f"模块 {mod_name} 重载失败: {e}")
+            send.group(group_id, f"模块 {mod_name} 重载失败: {e}")
+            return f"模块 {mod_name} 重载失败: {e}"
+        send.group(group_id, msg)
+        return msg
+
+    send.group(group_id, f"""未知参数: {sub}
+
+用法:
+1. mjb.reload all - 完整重载所有模块与配置（停止全部后台线程后重新加载，不重启程序）
+2. mjb.reload new - 加载模块目录中新增但尚未载入的模块
+3. mjb.reload mod <模块名> - 重载指定模块（如 mjb.reload mod bilibili）
+模块名列表可用 mjb.mod list 查看""")
+    return "参数错误"
 
 
 def _collect_loaded_modules():

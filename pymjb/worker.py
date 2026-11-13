@@ -2,6 +2,7 @@
 import ctypes
 import threading
 import time
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 
 from pymjb import logger, mjbconfig
@@ -16,6 +17,41 @@ _bg_lock = threading.Lock()
 
 # 需在主线程执行的任务列表
 _main_tasks = []
+
+# 模块上下文
+# 编排层在导入/初始化某个模块期间设置；该期间登记的线程、拦截器、命令
+# 会自动归属到这个模块，供单模块重载（mjb.reload mod）精确回滚。
+_module_ctx = threading.local()
+
+
+def set_module_context(name):
+    """设置当前线程的模块上下文（None 表示清除）"""
+    if name:
+        _module_ctx.name = name
+    else:
+        clear_module_context()
+
+
+def get_module_context():
+    """返回当前线程的模块上下文（不在模块加载期内返回 None）"""
+    return getattr(_module_ctx, "name", None)
+
+
+def clear_module_context():
+    """清除当前线程的模块上下文"""
+    if hasattr(_module_ctx, "name"):
+        del _module_ctx.name
+
+
+@contextlib.contextmanager
+def module_scope(name):
+    """with worker.module_scope("bilibili"): ... 期间登记的资源归属该模块"""
+    prev = get_module_context()
+    set_module_context(name)
+    try:
+        yield
+    finally:
+        set_module_context(prev)
 
 
 def _ensure_executor(max_workers=16):
@@ -73,20 +109,25 @@ def start_background(name, target, args=(), kwargs=None, daemon=True, stop_attr=
     # 快照创建线程时的账号上下文，注入到线程目标：后台线程内无参调用
     # mjbconfig getter 时路由到创建方账号（无上下文时用默认账号）
     bot_id = mjbconfig.get_current_bot_id()
+    # 快照创建线程时的模块上下文，注入到线程目标：线程内再派生线程时归属同一模块
+    module_name = get_module_context()
 
     def _target():
         prev = mjbconfig.get_current_bot_id()
+        prev_mod = get_module_context()
         try:
             if bot_id is not None:
                 mjbconfig.set_current_bot_id(bot_id)
             else:
                 mjbconfig.clear_current_bot_id()
+            set_module_context(module_name)
             return target(*args, **kwargs)
         finally:
             if prev is None:
                 mjbconfig.clear_current_bot_id()
             else:
                 mjbconfig.set_current_bot_id(prev)
+            set_module_context(prev_mod)
 
     t = threading.Thread(target=_target, name=name, daemon=daemon)
     with _bg_lock:
@@ -96,6 +137,7 @@ def start_background(name, target, args=(), kwargs=None, daemon=True, stop_attr=
             "target": target,
             "stop_event": stop_event,
             "stop_fn": stop_fn,
+            "module": module_name,
         }
     t.start()
     logger.info(f"后台线程已启动: {name}")
@@ -106,7 +148,8 @@ def register_thread(name, thread, stop_attr=None, stop_fn=None):
     """登记一个已存在/已启动的线程对象，便于统一回收"""
     with _bg_lock:
         _background_threads[name] = {
-            "thread": thread, "stop_attr": stop_attr, "target": None, "stop_fn": stop_fn}
+            "thread": thread, "stop_attr": stop_attr, "target": None, "stop_fn": stop_fn,
+            "module": get_module_context()}
     logger.info(f"已登记后台线程: {name}")
 
 
@@ -132,6 +175,11 @@ def stop_background(name):
         entry = _background_threads.get(name)
     if not entry:
         return False
+    return _request_stop(name, entry)
+
+
+def _request_stop(name, entry):
+    """向单个已登记线程发起停止请求"""
     target = entry.get("target")
     stop_attr = entry.get("stop_attr")
     # 1. 尝试调用 stop_attr 方法
@@ -189,43 +237,11 @@ def _force_stop_thread(t, retries=3, interval=0.5):
     return not t.is_alive()
 
 
-def stop_all_background(wait=True, timeout=5):
-    """停止所有后台线程，等待退出后清理登记表
-
-    用于 reload_all：确保旧线程彻底退出后再重新加载模块，避免线程重复创建。
-    依次尝试 stop_attr、stop_fn、stop_event 请求停止；WebUI Flask 等阻塞型线程
-    现已可通过 stop_fn 正常停止。仅对确实没有任何停止机制的线程记录警告。
-    join 超时仍未退出的线程会被强制终止（注入 SystemExit）。
-
-    Args:
-        wait: 是否 join 等待线程结束
-        timeout: 每个线程 join 超时秒数，超时后强制终止
-    """
-    with _bg_lock:
-        entries = dict(_background_threads)
-
-    # 请求所有线程停止
+def _stop_entries(entries, wait=True, timeout=5):
+    """停止给定的一批线程登记项并清理登记表，返回处理数量"""
+    # 请求停止
     for name, entry in entries.items():
-        target = entry.get("target")
-        stop_attr = entry.get("stop_attr")
-        stop_fn = entry.get("stop_fn")
-        stop_event = entry.get("stop_event")
-        if target and stop_attr and hasattr(target, stop_attr):
-            try:
-                getattr(target, stop_attr)()
-            except Exception as e:
-                logger.error(f"停止后台线程 {name} 失败: {e}")
-        elif stop_fn:
-            try:
-                stop_fn()
-            except Exception as e:
-                logger.error(f"停止后台线程 {name} 失败: {e}")
-        elif stop_event is not None:
-            try:
-                stop_event.set()
-            except Exception as e:
-                logger.error(f"触发停止事件失败 {name}: {e}")
-        else:
+        if not _request_stop(name, entry):
             logger.warning(f"后台线程 {name} 无停止机制，跳过")
 
     # 等待线程结束
@@ -245,8 +261,49 @@ def stop_all_background(wait=True, timeout=5):
 
     # 清理登记表
     with _bg_lock:
-        _background_threads.clear()
-    logger.info(f"已停止并清理 {len(entries)} 个后台线程登记")
+        for name in entries:
+            _background_threads.pop(name, None)
+    return len(entries)
+
+
+def stop_all_background(wait=True, timeout=5):
+    """停止所有后台线程，等待退出后清理登记表
+
+    用于 reload_all：确保旧线程彻底退出后再重新加载模块，避免线程重复创建。
+    依次尝试 stop_attr、stop_fn、stop_event 请求停止；WebUI Flask 等阻塞型线程
+    现已可通过 stop_fn 正常停止。仅对确实没有任何停止机制的线程记录警告。
+    join 超时仍未退出的线程会被强制终止（注入 SystemExit）。
+
+    Args:
+        wait: 是否 join 等待线程结束
+        timeout: 每个线程 join 超时秒数，超时后强制终止
+    """
+    with _bg_lock:
+        entries = dict(_background_threads)
+
+    count = _stop_entries(entries, wait=wait, timeout=timeout)
+    logger.info(f"已停止并清理 {count} 个后台线程登记")
+    return count
+
+
+def stop_module_background(module_name, wait=True, timeout=5):
+    """只停止归属指定模块的后台线程（供单模块重载使用）
+
+    Returns:
+        停止并清理的线程数量
+    """
+    if not module_name:
+        return 0
+    with _bg_lock:
+        entries = {n: e for n, e in _background_threads.items()
+                   if e.get("module") == module_name}
+    if not entries:
+        logger.info(f"模块 [{module_name}] 无登记的后台线程")
+        return 0
+    logger.info(f"模块 [{module_name}] 待停止后台线程: {', '.join(entries)}")
+    count = _stop_entries(entries, wait=wait, timeout=timeout)
+    logger.info(f"模块 [{module_name}] 已停止并清理 {count} 个后台线程")
+    return count
 
 
 def unregister_thread(name):

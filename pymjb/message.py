@@ -13,6 +13,12 @@ _interceptors = []          # 消息拦截器（有序）：fn(ctx) -> bool(是�
 _at_bot_handlers = []       # @bot 处理器：fn(ctx) -> bool(是否已处理)
 _notice_handlers = {}       # notice_type -> [fn(ctx)]
 
+# 钩子归属表（与上面的列表/字典严格等长）：记录注册时的模块上下文，
+# 供单模块重载（mjb.reload mod）只清理该模块注册的钩子
+_interceptor_owners = []
+_at_bot_owners = []
+_notice_owners = {}
+
 # QQ 心跳信息（多账号：bot_id -> info；None 键保留给无账号旧场景）
 _heartbeat_lock = threading.Lock()
 _heartbeat_info = {}  # bot_id -> {"online":bool,"interval":int,"timestamp":float,"raw_status":{}}
@@ -30,21 +36,73 @@ def _get_heartbeat_key(data):
 def register_interceptor(fn):
     """注册消息拦截器（按注册顺序执行；返回 True 表示已处理，终止管线）"""
     _interceptors.append(fn)
+    _interceptor_owners.append(worker.get_module_context())
 
 
 def register_at_bot_handler(fn):
     _at_bot_handlers.append(fn)
+    _at_bot_owners.append(worker.get_module_context())
 
 
 def register_notice_handler(notice_type, fn):
     _notice_handlers.setdefault(notice_type, []).append(fn)
+    _notice_owners.setdefault(notice_type, []).append(worker.get_module_context())
 
 
 def clear_handlers():
-    """清空所有已注册的拦截器与通知处理器（供 mjb.reload 使用）"""
+    """清空所有已注册的拦截器与通知处理器（供 mjb.reload all 使用）"""
     _interceptors.clear()
+    _interceptor_owners.clear()
     _at_bot_handlers.clear()
+    _at_bot_owners.clear()
     _notice_handlers.clear()
+    _notice_owners.clear()
+
+
+def clear_module_handlers(module_name):
+    """只清空指定模块注册的拦截器/@bot处理器/通知处理器（供 mjb.reload mod 使用）
+
+    Returns:
+        清理的钩子数量
+    """
+    if not module_name:
+        return 0
+
+    def _filter(items, owners):
+        kept_items, kept_owners, removed = [], [], 0
+        for item, owner in zip(items, owners):
+            if owner == module_name:
+                removed += 1
+            else:
+                kept_items.append(item)
+                kept_owners.append(owner)
+        return kept_items, kept_owners, removed
+
+    kept, owners, n1 = _filter(_interceptors, _interceptor_owners)
+    _interceptors[:] = kept
+    _interceptor_owners[:] = owners
+
+    kept, owners, n2 = _filter(_at_bot_handlers, _at_bot_owners)
+    _at_bot_handlers[:] = kept
+    _at_bot_owners[:] = owners
+
+    n3 = 0
+    for notice_type in list(_notice_handlers.keys()):
+        fns = _notice_handlers.get(notice_type, [])
+        owners = _notice_owners.get(notice_type, [None] * len(fns))
+        kept, kept_owners, removed = _filter(fns, owners)
+        n3 += removed
+        if kept:
+            _notice_handlers[notice_type] = kept
+            _notice_owners[notice_type] = kept_owners
+        else:
+            _notice_handlers.pop(notice_type, None)
+            _notice_owners.pop(notice_type, None)
+
+    total = n1 + n2 + n3
+    if total:
+        logger.info(f"模块 [{module_name}] 已清理 {total} 个钩子（拦截器 {n1}/@bot {n2}/通知 {n3}）")
+    return total
 
 
 def check_keyword_reply(group_id, message_content):
