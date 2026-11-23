@@ -2,8 +2,10 @@
 import os
 import json
 import random
+import datetime
 
-from pymjb import logger, mjbconfig, send, mjbmenu, mjbstatus, mjbutils, mjbtmpfile, worker
+from pymjb import (logger, mjbconfig, send, mjbmenu, mjbstatus, mjbutils,
+                   mjbtmpfile, mjbrender, officialid, worker)
 
 # 命令分发表：func_name -> 可调用对象
 command_functions = {}
@@ -161,9 +163,17 @@ def dispatch(cmd_name, group_id, user_id, config_data, *cmd_args):
         return True
 
     # 解析并调用函数
+    # 模块命令：官方账号的十六进制 ID 换成 30 位数字代理值，模块可直接 int()；
+    # 内置命令：保持框架原始 ID（与 group.json 中的配置格式一致）
     if func_name in command_functions:
         try:
-            result = command_functions[func_name](group_id, user_id, config_data, *cmd_args)
+            if func_name in _command_owners:
+                call_group_id = officialid.module_id(group_id)
+                call_user_id = officialid.module_id(user_id)
+            else:
+                call_group_id, call_user_id = group_id, user_id
+            result = command_functions[func_name](
+                call_group_id, call_user_id, config_data, *cmd_args)
             logger.info(f"命令执行结果: {result}")
         except Exception as e:
             logger.error(f"命令执行出错: {e}")
@@ -190,55 +200,16 @@ def _get_user_roles(group_id, user_id, config_data):
 def _render_help_image(group_id, showhidden, is_bot_admin, is_group_admin):
     """在线程池中用无头浏览器渲染帮助菜单 HTML 并截图发送
 
-    流程：生成 HTML -> 写临时文件 -> Selenium(Edge headless) 渲染并全页截图 -> 发图 -> 清理
+    流程：生成 HTML -> 公共渲染模块（无头 Edge 全页截图）-> 发图 -> 清理
     """
-    import time
-
-    html_path = None
     png_path = None
-    driver = None
     try:
-        from selenium import webdriver
-        from selenium.webdriver.edge.options import Options
-
         html_content = mjbmenu.generate_html(showhidden, is_bot_admin, is_group_admin)
-        html_path = mjbtmpfile.create(suffix=".html", prefix="help_")
-        png_path = mjbtmpfile.create(suffix=".png", prefix="help_")
-        if not html_path or not png_path:
-            send.group(group_id, "帮助图片生成失败：无法创建临时文件")
+        png_path = mjbrender.html_to_image(html_content, width=720)
+        if not png_path:
+            send.group(group_id, "帮助图片生成失败")
             return
 
-        with open(html_path, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-
-        # file:// URI（Windows 路径反斜杠需转为正斜杠）
-        file_uri = "file:///" + os.path.abspath(html_path).replace(os.sep, "/")
-
-        options = Options()
-        options.add_argument('--headless=new')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--window-size=760,1080')
-
-        driver = webdriver.Edge(options=options)
-        driver.set_page_load_timeout(15)
-        driver.get(file_uri)
-
-        # 等待字体与布局就绪
-        time.sleep(1)
-
-        # 全页截图：将窗口高度调整为内容实际高度后截图
-        try:
-            total_height = driver.execute_script(
-                "return Math.max(document.body.scrollHeight, "
-                "document.documentElement.scrollHeight);")
-            driver.set_window_size(760, int(total_height))
-            time.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"获取页面高度失败: {e}")
-
-        driver.save_screenshot(png_path)
         logger.info(f"帮助图片已生成: {png_path}")
 
         success = send.group_image(group_id, png_path)
@@ -248,13 +219,6 @@ def _render_help_image(group_id, showhidden, is_bot_admin, is_group_admin):
         logger.error(f"渲染帮助图片失败: {e}")
         send.group(group_id, f"帮助图片生成失败: {e}")
     finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-        if html_path and os.path.exists(html_path):
-            mjbtmpfile.cleanup_now(html_path)
         if png_path and os.path.exists(png_path):
             mjbtmpfile.cleanup_now(png_path)
 
@@ -376,7 +340,7 @@ def cmd_help(group_id, user_id, config_data, *args):
             # 直接调用合并转发接口发送节点（统一走 send._post，自动附带账号 token）
             response = send._post(
                 "send_group_forward_msg", group_id=group_id,
-                json={"group_id": int(group_id), "messages": result["forward_messages"]},
+                json={"group_id": send._nid(group_id), "messages": result["forward_messages"]},
                 timeout=15,
             )
             return "已发送帮助信息"
@@ -423,20 +387,20 @@ def cmd_notice(group_id, user_id, config_data, *args):
 
 
 def cmd_reboot(group_id, user_id, config_data, *args):
-    """重启 bot（仅管理员）"""
+    """重启程序并重新自检（仅Bot管理员）"""
     admin_list = mjbutils.get_admin_list_from_config(config_data)
     if str(user_id) not in admin_list:
-        send.group(group_id, "权限不足，仅Bot管理员可重启")
+        send.group(group_id, "权限不足，只有Bot管理员可以使用此命令")
+        logger.info(f"无权限用户{user_id}尝试使用reboot命令")
         return "权限不足"
-    send.group(group_id, "正在重启...")
-    logger.warning("收到重启命令，即将重启程序")
+
+    send.group(group_id, "正在重启程序，请稍候...")
+    logger.warning(f"Bot管理员{user_id}触发了程序重启")
+
     try:
-        import sys
-        import subprocess
-        python = sys.executable
-        subprocess.Popen([python, __file__])  # 由编排层重写实际入口
-        import os as _os
-        _os._exit(0)
+        # 守护开启时用特殊退出码交给守护父进程立即重启；未守护时 execv 重启自身
+        from crashhandler import request_restart
+        request_restart()
     except Exception as e:
         logger.error(f"重启失败: {e}")
         send.group(group_id, f"重启失败: {e}")
@@ -614,32 +578,84 @@ def cmd_mod(group_id, user_id, config_data, *args):
 
 
 def cmd_botban(group_id, user_id, config_data, *args):
-    """将用户加入 bot 黑名单"""
-    if not args:
-        send.group(group_id, "请提供要拉黑的用户QQ或@用户")
-        return "未提供参数"
-    target = mjbutils.extract_qq_from_at(args[0])
-    banned = mjbconfig.load_banuser()
-    banned[str(target)] = {"banned_by": str(user_id), "banned_time": int(__import__("time").time())}
-    mjbconfig.save_banuser(banned)
-    send.group(group_id, f"已将 {target} 加入bot黑名单")
-    return f"已拉黑 {target}"
+    """将用户拉入 bot 黑名单，仅 Bot 管理员可用
+
+    参数：QQ号或@人的 CQ 码 原因
+    """
+    admin_list = mjbutils.get_admin_list_from_config(config_data)
+    if str(user_id) not in admin_list:
+        send.group(group_id, "权限不足，只有Bot管理员可以使用此命令。")
+        logger.info(f"无权限用户{user_id}尝试使用mjb.botban命令")
+        return "权限不足"
+
+    if len(args) < 2:
+        send.group(group_id, "请提供要拉黑的QQ号和原因，格式：mjb.botban QQ号 原因")
+        return "参数不足，请提供要拉黑的QQ号和原因"
+
+    try:
+        # 第一个参数支持 @ 的 CQ 码，其余合并为原因
+        target = str(mjbutils.extract_qq_from_at(args[0]))
+        reason = " ".join(args[1:])
+
+        banned = mjbconfig.load_banuser()
+        if target in banned:
+            send.group(group_id, f"用户{target}已经在bot黑名单中。")
+            return f"用户{target}已经在bot黑名单中"
+
+        banned[target] = {
+            "banned_by": str(user_id),
+            "banned_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason,
+        }
+        mjbconfig.save_banuser(banned)
+
+        message = f"成功将用户{target}拉入bot黑名单，原因：{reason}"
+        send.group(group_id, message)
+        logger.info(f"管理员{user_id}将用户{target}拉入bot黑名单，原因：{reason}")
+        return message
+    except Exception as e:
+        message = f"拉黑失败，发生错误：{e}"
+        send.group(group_id, message)
+        logger.error(message)
+        return message
 
 
 def cmd_botunban(group_id, user_id, config_data, *args):
-    """将用户移出 bot 黑名单"""
-    if not args:
-        send.group(group_id, "请提供要解除拉黑的用户QQ")
-        return "未提供参数"
-    target = mjbutils.extract_qq_from_at(args[0])
-    banned = mjbconfig.load_banuser()
-    if str(target) in banned:
-        del banned[str(target)]
+    """将用户从 bot 黑名单中解除，仅 Bot 管理员可用
+
+    参数：QQ号或@人的 CQ 码 原因
+    """
+    admin_list = mjbutils.get_admin_list_from_config(config_data)
+    if str(user_id) not in admin_list:
+        send.group(group_id, "权限不足，只有Bot管理员可以使用此命令。")
+        logger.info(f"无权限用户{user_id}尝试使用mjb.botunban命令")
+        return "权限不足"
+
+    if len(args) < 2:
+        send.group(group_id, "请提供要解除拉黑的QQ号和原因，格式：mjb.botunban QQ号 原因")
+        return "参数不足，请提供要解除拉黑的QQ号和原因"
+
+    try:
+        target = str(mjbutils.extract_qq_from_at(args[0]))
+        reason = " ".join(args[1:])
+
+        banned = mjbconfig.load_banuser()
+        if target not in banned:
+            send.group(group_id, f"用户{target}不在bot黑名单中。")
+            return f"用户{target}不在bot黑名单中"
+
+        del banned[target]
         mjbconfig.save_banuser(banned)
-        send.group(group_id, f"已将 {target} 移出bot黑名单")
-        return f"已解除拉黑 {target}"
-    send.group(group_id, f"{target} 不在黑名单中")
-    return "不在黑名单"
+
+        message = f"成功将用户{target}从bot黑名单中解除，原因：{reason}"
+        send.group(group_id, message)
+        logger.info(f"管理员{user_id}将用户{target}从bot黑名单中解除，原因：{reason}")
+        return message
+    except Exception as e:
+        message = f"解除拉黑失败，发生错误：{e}"
+        send.group(group_id, message)
+        logger.error(message)
+        return message
 
 
 def cmd_event(group_id, user_id, config_data, *args):
@@ -692,7 +708,7 @@ def cmd_likeme(group_id, user_id, config_data, *args):
         else:
             target_user_id = user_id
 
-        result = send.api('send_like', user_id=int(target_user_id), times=10)
+        result = send.api('send_like', user_id=send._nid(target_user_id), times=10)
 
         if result.get('status') == 'ok' and result.get('retcode') == 0:
             send.group(group_id, f"已为{target_user_id}点赞10次！")
@@ -720,7 +736,7 @@ def cmd_poke(group_id, user_id, config_data, *args):
         else:
             target_user_id = user_id
 
-        result = send.api('group_poke', group_id=int(group_id), user_id=int(target_user_id))
+        result = send.api('group_poke', group_id=send._nid(group_id), user_id=send._nid(target_user_id))
 
         if result.get('status') == 'ok' and result.get('retcode') == 0:
             logger.info(f"已戳用户{target_user_id}一下")
@@ -1337,7 +1353,7 @@ def cmd_setauthok(group_id, user_id, config_data, *args):
     logger.info(f"Bot管理员{user_id}已将用户{target_qq}在群{group_id}中设置为验证通过")
 
     try:
-        send.group_at(group_id, int(target_qq), " 验证已通过，新人请看公告，欢迎入群聊天")
+        send.group_at(group_id, send._nid(target_qq), " 验证已通过，新人请看公告，欢迎入群聊天")
     except Exception as e:
         logger.error(f"@用户通知验证成功失败: {e}")
 

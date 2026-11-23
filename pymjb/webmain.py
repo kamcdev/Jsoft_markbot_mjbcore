@@ -12,7 +12,7 @@ import ipaddress
 from flask import Flask, request, jsonify, send_from_directory, make_response
 from werkzeug.serving import make_server
 
-from pymjb import logger, mjbconfig, mjbstatus, worker, message
+from pymjb import logger, mjbconfig, mjbstatus, worker, message, filexfer
 
 _webui_app = None
 _start_time = time.time()
@@ -132,8 +132,20 @@ def _create_app():
     def serve_js(filename):
         return send_from_directory(os.path.join(webui_dir, "js"), filename)
 
+    @app.route("/official_mode_file/<file_id>")
+    def official_mode_file(file_id):
+        """官机模式文件直链：12 小时内不限次数下载，过期后路由与清理线程都会删文件"""
+        path, download_name = filexfer.find_export(file_id)
+        if not path:
+            return "文件不存在或已过期（有效期 12 小时）", 404
+        return send_from_directory(os.path.dirname(path), os.path.basename(path),
+                                   as_attachment=True, download_name=download_name)
+
     @app.route("/<path:filename>")
     def serve_static(filename):
+        # 官机模式外链目录不允许当静态资源直接访问（否则可绕过有效期与 id 校验）
+        if filename == filexfer.SUBDIR or filename.startswith(filexfer.SUBDIR + "/"):
+            return "文件不存在", 404
         static_path = os.path.join(webui_dir, filename)
         if os.path.exists(static_path):
             return send_from_directory(webui_dir, filename)

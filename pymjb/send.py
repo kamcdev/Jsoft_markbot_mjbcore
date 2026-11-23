@@ -2,7 +2,34 @@
 import os
 import requests
 
-from pymjb import logger, mjbconfig
+from pymjb import logger, mjbconfig, mjbrender, mjbtmpfile, officialid, worker, filexfer
+
+
+# 需要按官方 ID 规则还原的字段（模块可能已把它们 int() 成 30 位数字）
+_ID_KEYS = {
+    "group_id", "user_id", "self_id", "target_id", "target_user_id",
+    "message_id", "qq", "uin", "operator_id", "sender_id",
+}
+
+
+def _nid(value):
+    """ID 归一化：普通数字转 int，官方字母 ID 原样透传，30 位代理值还原成官方 ID"""
+    return officialid.wire_id(value)
+
+
+def _restore_ids(obj):
+    """递归还原请求体里的 30 位代理 ID（模块 int() 过的值也在此还原）"""
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if key in _ID_KEYS:
+                out[key] = officialid.to_raw(value)
+            else:
+                out[key] = _restore_ids(value)
+        return out
+    if isinstance(obj, list):
+        return [_restore_ids(item) for item in obj]
+    return obj
 
 
 def _resolve_bot(bot_id=None, group_id=None):
@@ -13,9 +40,12 @@ def _resolve_bot(bot_id=None, group_id=None):
     """
     if bot_id is None and group_id is not None:
         if mjbconfig.get_current_bot_id() is None:
-            mapped = mjbconfig.get_bot_id_by_group(str(group_id))
+            mapped = mjbconfig.get_bot_id_by_group(str(officialid.to_raw(group_id)))
             if mapped:
                 bot_id = mapped
+    # 判定上不存在的账号（账号门闸互斥）不能作为发送目标，回退到当前可用账号
+    if bot_id is not None and mjbconfig.is_account_inactive(bot_id):
+        bot_id = None
     return bot_id
 
 
@@ -34,6 +64,8 @@ def _headers(bot_id=None, group_id=None):
 
 def _post(action, bot_id=None, group_id=None, **kwargs):
     """统一 API POST 入口：按账号自动附带 token（未配置 token 时不携带）"""
+    if "json" in kwargs:
+        kwargs["json"] = _restore_ids(kwargs["json"])
     return requests.post(
         _url(action, bot_id, group_id),
         headers=_headers(bot_id, group_id),
@@ -45,7 +77,7 @@ def api(action, bot_id=None, **payload):
     """通用 OnebotQQ HTTP API 调用"""
     try:
         group_id = payload.get("group_id")
-        response = _post(action, bot_id, group_id, json=payload, timeout=15)
+        response = _post(action, bot_id, group_id, json=_restore_ids(payload), timeout=15)
         return response.json()
     except Exception as e:
         logger.error(f"调用 API {action} 失败: {e}")
@@ -85,12 +117,12 @@ def group_reply(group_id, user_id, message_id, content, bot_id=None):
     """发送引用消息回复"""
     try:
         message_content = [
-            {"type": "reply", "data": {"id": int(message_id)}},
-            {"type": "at", "data": {"qq": int(user_id)}},
+            {"type": "reply", "data": {"id": _nid(message_id)}},
+            {"type": "at", "data": {"qq": _nid(user_id)}},
             {"type": "text", "data": {"text": f" {content}"}},
         ]
         _post("send_group_msg", bot_id, group_id, json={
-            "group_id": int(group_id),
+            "group_id": _nid(group_id),
             "message": message_content,
         }, timeout=15)
         logger.info(f"引用消息发送成功: 群{group_id}，回复消息{message_id}")
@@ -115,7 +147,7 @@ def group_image(group_id, image_path, bot_id=None):
 
         abs_image_path = os.path.abspath(image_path)
         payload = {
-            "group_id": int(group_id) if isinstance(group_id, str) else group_id,
+            "group_id": _nid(group_id),
             "message": [{"type": "image", "data": {"file": abs_image_path}}],
         }
         response = _post("send_group_msg", bot_id, group_id, json=payload, timeout=15)
@@ -140,7 +172,7 @@ def private(user_id, content, bot_id=None):
     """发送私聊文本消息"""
     try:
         payload = {
-            "user_id": int(user_id),
+            "user_id": _nid(user_id),
             "message": [{"type": "text", "data": {"text": content}}],
         }
         response = _post("send_private_msg", bot_id, json=payload, timeout=15)
@@ -152,27 +184,96 @@ def private(user_id, content, bot_id=None):
         return False
 
 
+def _build_forward_node(messages, fake_qq=None, fake_name=None):
+    """把消息列表组装成一个合并转发节点"""
+    content_items = []
+    for msg in messages:
+        if isinstance(msg, str):
+            content_items.append({"type": "text", "data": {"text": msg}})
+        elif isinstance(msg, dict) and "text" in msg:
+            content_items.append({"type": "text", "data": {"text": msg["text"]}})
+        elif isinstance(msg, dict) and "file" in msg:
+            content_items.append({"type": "image", "data": {"file": msg["file"]}})
+    node_data = {"type": "node", "data": {"content": content_items}}
+    if fake_qq:
+        node_data["data"]["uin"] = fake_qq
+    if fake_name:
+        node_data["data"]["name"] = fake_name
+    return node_data
+
+
+def _notify_forward(target_id, is_group, text, bot_id=None):
+    """给合并转发的目标（群或私聊）发送一条文本提示"""
+    if is_group:
+        group(target_id, text, bot_id=bot_id)
+    else:
+        private(target_id, text, bot_id=bot_id)
+
+
+def _send_private_image(user_id, image_path, bot_id=None):
+    """发送私聊图片消息"""
+    try:
+        if not os.path.exists(image_path):
+            logger.error(f"错误：图片文件不存在: {image_path}")
+            return False
+        payload = {
+            "user_id": _nid(user_id),
+            "message": [{"type": "image", "data": {"file": os.path.abspath(image_path)}}],
+        }
+        response = _post("send_private_msg", bot_id, json=payload, timeout=15)
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        logger.error(f"发送私聊图片消息失败: {e}")
+        return False
+
+
+def _render_forward_image(target_id, is_group, node, fake_name, fake_qq, bot_id):
+    """official_mode 后台任务：把合并转发节点渲染成聊天记录图片并发送"""
+    png_path = None
+    try:
+        png_path = mjbrender.render_forward_chat(
+            [node], fake_name=fake_name, fake_qq=fake_qq)
+        if not png_path:
+            _notify_forward(target_id, is_group, "图片生成失败", bot_id)
+            return
+        if is_group:
+            ok = group_image(target_id, png_path, bot_id=bot_id)
+        else:
+            ok = _send_private_image(target_id, png_path, bot_id=bot_id)
+        if not ok:
+            _notify_forward(target_id, is_group, "图片发送失败", bot_id)
+    except Exception as e:
+        logger.error(f"合并转发转图片失败: {e}")
+        _notify_forward(target_id, is_group, f"图片生成失败: {e}", bot_id)
+    finally:
+        if png_path:
+            mjbtmpfile.cleanup(png_path)
+
+
+def _forward_as_image(target_id, is_group, node, fake_name=None, fake_qq=None, bot_id=None):
+    """official_mode：合并转发内容改发图片（异步渲染，立即返回）"""
+    if is_group and (not target_id or target_id == 0):
+        return
+    _notify_forward(target_id, is_group, "正在生成图片，请稍候...", bot_id)
+    worker.submit(_render_forward_image, target_id, is_group, node,
+                  fake_name, fake_qq, bot_id)
+
+
 def send_group_forward_msg(group_id, messages, fake_qq=None, fake_name=None, bot_id=None):
     """发送群聊合并转发消息
 
     Args:
         messages: 字符串列表或含 text/file 的字典列表
         fake_qq/fake_name: 伪造的 QQ 号/昵称
+
+    coreset 开启 official_mode 时，内容会转成聊天记录图片发送（异步，立即返回占位结果）。
     """
     try:
-        content_items = []
-        for msg in messages:
-            if isinstance(msg, str):
-                content_items.append({"type": "text", "data": {"text": msg}})
-            elif isinstance(msg, dict) and "text" in msg:
-                content_items.append({"type": "text", "data": {"text": msg["text"]}})
-            elif isinstance(msg, dict) and "file" in msg:
-                content_items.append({"type": "image", "data": {"file": msg["file"]}})
-        node_data = {"type": "node", "data": {"content": content_items}}
-        if fake_qq:
-            node_data["data"]["uin"] = fake_qq
-        if fake_name:
-            node_data["data"]["name"] = fake_name
+        node_data = _build_forward_node(messages, fake_qq, fake_name)
+        if mjbconfig.get_official_mode(_resolve_bot(bot_id, group_id)):
+            _forward_as_image(group_id, True, node_data, fake_name, fake_qq, bot_id)
+            return {"status": "ok", "message": "已转为图片发送"}
         response = _post("send_group_forward_msg", bot_id, group_id, json={
             "group_id": group_id,
             "messages": [node_data],
@@ -186,6 +287,8 @@ def send_group_forward_msg(group_id, messages, fake_qq=None, fake_name=None, bot
 def send_group_file(group_id, file_path, file_name=None, folder_id=None, bot_id=None):
     """发送群文件
 
+    官机（official_mode）账号由框架统一转为 WebUI 外链，模块照常调用本函数即可。
+
     Returns:
         tuple: (是否成功, 错误信息或"成功")
     """
@@ -195,7 +298,18 @@ def send_group_file(group_id, file_path, file_name=None, folder_id=None, bot_id=
             return (False, "文件不存在")
         if not file_name:
             file_name = os.path.basename(file_path)
-        payload = {"group_id": int(group_id), "file": file_path, "name": file_name}
+
+        # 官机模式：官方端不支持群文件，导出到 WebUI 目录后只发取件链接
+        target_bot = _resolve_bot(bot_id, group_id)
+        if mjbconfig.get_official_mode(target_bot):
+            ok, info = filexfer.deliver(group_id, file_path, file_name)
+            if not ok:
+                logger.error(f"官机模式文件外链生成失败: {info}")
+                return (False, info)
+            logger.info(f"官机模式已转为外链发送: {info}")
+            return (True, "已转为外链发送")
+
+        payload = {"group_id": _nid(group_id), "file": file_path, "name": file_name}
         if folder_id:
             payload["folder_id"] = folder_id
         response = _post("upload_group_file", bot_id, group_id, json=payload, timeout=30)
@@ -218,7 +332,7 @@ def send_group_file(group_id, file_path, file_name=None, folder_id=None, bot_id=
 def get_group_member_role(group_id, user_id, bot_id=None):
     """获取群成员身份：owner/admin/member/unknown"""
     try:
-        payload = {"group_id": int(group_id), "user_id": int(user_id), "no_cache": False}
+        payload = {"group_id": _nid(group_id), "user_id": _nid(user_id), "no_cache": False}
         response = _post("get_group_member_info", bot_id, group_id, json=payload, timeout=10)
         if response.status_code == 200:
             data = response.json()
@@ -234,7 +348,7 @@ def get_group_member_info(group_id, user_id, bot_id=None):
     """获取群成员信息（完整 dict）"""
     try:
         response = _post("get_group_member_info", bot_id, group_id, json={
-            "group_id": int(group_id), "user_id": int(user_id),
+            "group_id": _nid(group_id), "user_id": _nid(user_id),
         }, timeout=10)
         if response.status_code == 200:
             data = response.json()
@@ -279,7 +393,7 @@ def get_stranger_info(user_id, bot_id=None):
 def delete_msg(message_id, bot_id=None):
     """撤回消息"""
     try:
-        _post("delete_msg", bot_id, json={"message_id": int(message_id)}, timeout=5)
+        _post("delete_msg", bot_id, json={"message_id": _nid(message_id)}, timeout=5)
         return True
     except Exception as e:
         logger.error(f"撤回消息失败: {e}")
@@ -290,7 +404,7 @@ def set_group_kick(group_id, user_id, reject_add_request=False, bot_id=None):
     """踢出群成员"""
     try:
         _post("set_group_kick", bot_id, group_id, json={
-            "group_id": int(group_id), "user_id": int(user_id),
+            "group_id": _nid(group_id), "user_id": _nid(user_id),
             "reject_add_request": reject_add_request,
         }, timeout=5)
         logger.info(f"已将用户{user_id}从群{group_id}踢出")
@@ -304,7 +418,7 @@ def set_group_ban(group_id, user_id, duration=0, bot_id=None):
     """禁言成员（duration 秒，0 表示解除）"""
     try:
         _post("set_group_ban", bot_id, group_id, json={
-            "group_id": int(group_id), "user_id": int(user_id),
+            "group_id": _nid(group_id), "user_id": _nid(user_id),
             "duration": int(duration),
         }, timeout=5)
         return True
@@ -316,7 +430,7 @@ def set_group_ban(group_id, user_id, duration=0, bot_id=None):
 def send_like(user_id, times=10, bot_id=None):
     """点赞"""
     try:
-        return api("send_like", user_id=int(user_id), times=times, bot_id=bot_id)
+        return api("send_like", user_id=_nid(user_id), times=times, bot_id=bot_id)
     except Exception as e:
         logger.error(f"点赞失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -325,7 +439,7 @@ def send_like(user_id, times=10, bot_id=None):
 def send_poke(group_id, user_id, bot_id=None):
     """戳一戳"""
     try:
-        return api("group_poke", bot_id=bot_id, group_id=int(group_id), user_id=int(user_id))
+        return api("group_poke", bot_id=bot_id, group_id=_nid(group_id), user_id=_nid(user_id))
     except Exception as e:
         logger.error(f"戳一戳失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -334,8 +448,8 @@ def send_poke(group_id, user_id, bot_id=None):
 def set_group_special_title(group_id, user_id, special_title="", bot_id=None):
     """设置群成员专属头衔（special_title 为空字符串表示去掉群头衔）"""
     try:
-        return api("set_group_special_title", group_id=int(group_id),
-                   user_id=int(user_id), special_title=special_title, bot_id=bot_id)
+        return api("set_group_special_title", group_id=_nid(group_id),
+                   user_id=_nid(user_id), special_title=special_title, bot_id=bot_id)
     except Exception as e:
         logger.error(f"设置群头衔失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -344,7 +458,7 @@ def set_group_special_title(group_id, user_id, special_title="", bot_id=None):
 def set_essence_msg(message_id, bot_id=None):
     """设置群精华消息"""
     try:
-        return api("set_essence_msg", message_id=int(message_id), bot_id=bot_id)
+        return api("set_essence_msg", message_id=_nid(message_id), bot_id=bot_id)
     except Exception as e:
         logger.error(f"设置群精华消息失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -569,21 +683,14 @@ def send_private_forward_msg(user_id, messages, fake_qq=None, fake_name=None, bo
     Args:
         messages: 字符串列表或含 text/file 的字典列表
         fake_qq/fake_name: 伪造的 QQ 号/昵称
+
+    coreset 开启 official_mode 时，内容会转成聊天记录图片发送（异步，立即返回占位结果）。
     """
     try:
-        content_items = []
-        for msg in messages:
-            if isinstance(msg, str):
-                content_items.append({"type": "text", "data": {"text": msg}})
-            elif isinstance(msg, dict) and "text" in msg:
-                content_items.append({"type": "text", "data": {"text": msg["text"]}})
-            elif isinstance(msg, dict) and "file" in msg:
-                content_items.append({"type": "image", "data": {"file": msg["file"]}})
-        node_data = {"type": "node", "data": {"content": content_items}}
-        if fake_qq:
-            node_data["data"]["uin"] = fake_qq
-        if fake_name:
-            node_data["data"]["name"] = fake_name
+        node_data = _build_forward_node(messages, fake_qq, fake_name)
+        if mjbconfig.get_official_mode(_resolve_bot(bot_id, user_id)):
+            _forward_as_image(user_id, False, node_data, fake_name, fake_qq, bot_id)
+            return {"status": "ok", "message": "已转为图片发送"}
         return api("send_private_forward_msg", bot_id=bot_id, user_id=user_id,
                    messages=[node_data])
     except Exception as e:
@@ -596,7 +703,7 @@ def forward_friend_single_msg(user_id, message_id, bot_id=None):
     """转发单条好友消息"""
     try:
         return api("forward_friend_single_msg", bot_id=bot_id,
-                   user_id=int(user_id), message_id=int(message_id))
+                   user_id=_nid(user_id), message_id=_nid(message_id))
     except Exception as e:
         logger.error(f"转发单条好友消息失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -606,7 +713,7 @@ def forward_group_single_msg(group_id, message_id, bot_id=None):
     """转发单条群消息"""
     try:
         return api("forward_group_single_msg", bot_id=bot_id,
-                   group_id=int(group_id), message_id=int(message_id))
+                   group_id=_nid(group_id), message_id=_nid(message_id))
     except Exception as e:
         logger.error(f"转发单条群消息失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -615,7 +722,7 @@ def forward_group_single_msg(group_id, message_id, bot_id=None):
 def get_msg(message_id, bot_id=None):
     """获取消息详情"""
     try:
-        return api("get_msg", bot_id=bot_id, message_id=int(message_id))
+        return api("get_msg", bot_id=bot_id, message_id=_nid(message_id))
     except Exception as e:
         logger.error(f"获取消息详情失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -652,7 +759,7 @@ def set_msg_emoji_like(message_id, emoji_id, set=True, bot_id=None):
     """表情回应消息（只支持群聊消息）"""
     try:
         return api("set_msg_emoji_like", bot_id=bot_id,
-                   message_id=int(message_id), emoji_id=int(emoji_id), set=set)
+                   message_id=_nid(message_id), emoji_id=int(emoji_id), set=set)
     except Exception as e:
         logger.error(f"表情回应消息失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -661,7 +768,7 @@ def set_msg_emoji_like(message_id, emoji_id, set=True, bot_id=None):
 def fetch_emoji_like(message_id, emoji_id, count=20, cookie=None, bot_id=None):
     """获取表情回应详情"""
     try:
-        payload = {"message_id": int(message_id), "emoji_id": int(emoji_id), "count": count}
+        payload = {"message_id": _nid(message_id), "emoji_id": int(emoji_id), "count": count}
         if cookie is not None:
             payload["cookie"] = cookie
         return api("fetch_emoji_like", bot_id=bot_id, **payload)
@@ -673,7 +780,7 @@ def fetch_emoji_like(message_id, emoji_id, count=20, cookie=None, bot_id=None):
 def get_friend_msg_history(user_id, message_seq=0, count=20, reverse_order=False, bot_id=None):
     """获取好友历史消息记录"""
     try:
-        return api("get_friend_msg_history", bot_id=bot_id, user_id=int(user_id),
+        return api("get_friend_msg_history", bot_id=bot_id, user_id=_nid(user_id),
                    message_seq=message_seq, count=count, reverseOrder=reverse_order)
     except Exception as e:
         logger.error(f"获取好友历史消息记录失败: {e}")
@@ -683,7 +790,7 @@ def get_friend_msg_history(user_id, message_seq=0, count=20, reverse_order=False
 def get_group_msg_history(group_id, message_seq=0, count=20, reverse_order=False, bot_id=None):
     """获取群历史消息（message_seq 填 0 表示从最新开始）"""
     try:
-        return api("get_group_msg_history", bot_id=bot_id, group_id=int(group_id),
+        return api("get_group_msg_history", bot_id=bot_id, group_id=_nid(group_id),
                    message_seq=message_seq, count=count, reverseOrder=reverse_order)
     except Exception as e:
         logger.error(f"获取群历史消息失败: {e}")
@@ -702,7 +809,7 @@ def get_forward_msg(message_id, bot_id=None):
 def mark_msg_as_read(message_id, bot_id=None):
     """标记消息已读"""
     try:
-        return api("mark_msg_as_read", bot_id=bot_id, message_id=int(message_id))
+        return api("mark_msg_as_read", bot_id=bot_id, message_id=_nid(message_id))
     except Exception as e:
         logger.error(f"标记消息已读失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -711,7 +818,7 @@ def mark_msg_as_read(message_id, bot_id=None):
 def voice_msg_to_text(message_id, bot_id=None):
     """语音消息转文字（需要 LLOneBot 5.1 及以上版本）"""
     try:
-        return api("voice_msg_to_text", bot_id=bot_id, message_id=int(message_id))
+        return api("voice_msg_to_text", bot_id=bot_id, message_id=_nid(message_id))
     except Exception as e:
         logger.error(f"语音消息转文字失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -721,7 +828,7 @@ def voice_msg_to_text(message_id, bot_id=None):
 def send_group_ai_record(group_id, character, text, bot_id=None):
     """发送群 AI 语音（character 为语音声色，需要 LLOneBot 5.6.1 及以上版本）"""
     try:
-        return api("send_group_ai_record", bot_id=bot_id, group_id=int(group_id),
+        return api("send_group_ai_record", bot_id=bot_id, group_id=_nid(group_id),
                    character=character, text=text)
     except Exception as e:
         logger.error(f"发送群AI语音失败: {e}")
@@ -733,7 +840,7 @@ def get_ai_characters(group_id=None, chat_type=1, bot_id=None):
     try:
         payload = {"chat_type": chat_type}
         if group_id is not None:
-            payload["group_id"] = int(group_id)
+            payload["group_id"] = _nid(group_id)
         return api("get_ai_characters", bot_id=bot_id, **payload)
     except Exception as e:
         logger.error(f"获取群AI语音声色列表失败: {e}")
@@ -743,9 +850,9 @@ def get_ai_characters(group_id=None, chat_type=1, bot_id=None):
 def private_poke(user_id, target_id=None, bot_id=None):
     """私聊戳一戳（发送戳一戳，action send_poke，需 LLBot 7.11.3+；target_id 为目标 QQ 号，仅私聊生效）"""
     try:
-        payload = {"user_id": int(user_id)}
+        payload = {"user_id": _nid(user_id)}
         if target_id is not None:
-            payload["target_id"] = int(target_id)
+            payload["target_id"] = _nid(target_id)
         return api("send_poke", bot_id=bot_id, **payload)
     except Exception as e:
         logger.error(f"私聊戳一戳失败: {e}")
@@ -755,7 +862,7 @@ def private_poke(user_id, target_id=None, bot_id=None):
 def friend_poke(user_id, bot_id=None):
     """好友戳一戳（双击头像，action friend_poke）"""
     try:
-        return api("friend_poke", bot_id=bot_id, user_id=int(user_id))
+        return api("friend_poke", bot_id=bot_id, user_id=_nid(user_id))
     except Exception as e:
         logger.error(f"好友戳一戳失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -786,7 +893,7 @@ def get_friends_with_category(bot_id=None):
 def delete_friend(user_id, bot_id=None):
     """删除好友"""
     try:
-        return api("delete_friend", bot_id=bot_id, user_id=int(user_id))
+        return api("delete_friend", bot_id=bot_id, user_id=_nid(user_id))
     except Exception as e:
         logger.error(f"删除好友失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -805,7 +912,7 @@ def set_friend_add_request(flag, approve=True, remark="", bot_id=None):
 def set_friend_remark(user_id, remark, bot_id=None):
     """设置好友备注"""
     try:
-        return api("set_friend_remark", bot_id=bot_id, user_id=int(user_id), remark=remark)
+        return api("set_friend_remark", bot_id=bot_id, user_id=_nid(user_id), remark=remark)
     except Exception as e:
         logger.error(f"设置好友备注失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -841,7 +948,7 @@ def get_profile_like_me(start=0, count=20, bot_id=None):
 def get_profile_like_count(user_id, bot_id=None):
     """获取名片赞数量（需要 LLBot 8.0.3 及以上版本）"""
     try:
-        return api("get_profile_like_count", bot_id=bot_id, user_id=int(user_id))
+        return api("get_profile_like_count", bot_id=bot_id, user_id=_nid(user_id))
     except Exception as e:
         logger.error(f"获取名片赞数量失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -860,7 +967,7 @@ def set_friend_category(user_id, category_id, bot_id=None):
     """移动好友分组"""
     try:
         return api("set_friend_category", bot_id=bot_id,
-                   user_id=int(user_id), category_id=int(category_id))
+                   user_id=_nid(user_id), category_id=int(category_id))
     except Exception as e:
         logger.error(f"移动好友分组失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -871,9 +978,9 @@ def get_qq_avatar(user_id=None, group_id=None, bot_id=None):
     try:
         payload = {}
         if user_id is not None:
-            payload["user_id"] = int(user_id)
+            payload["user_id"] = _nid(user_id)
         if group_id is not None:
-            payload["group_id"] = int(group_id)
+            payload["group_id"] = _nid(group_id)
         return api("get_qq_avatar", bot_id=bot_id, **payload)
     except Exception as e:
         logger.error(f"获取QQ头像失败: {e}")
@@ -916,7 +1023,7 @@ def set_input_status(user_id, event_type, bot_id=None):
     """设置输入状态（event_type 为 0 表示「对方正在说话...」，为 1 表示「对方正在输入...」；需要 LLBot 7.12.3 及以上版本）"""
     try:
         return api("set_input_status", bot_id=bot_id,
-                   user_id=int(user_id), event_type=int(event_type))
+                   user_id=_nid(user_id), event_type=int(event_type))
     except Exception as e:
         logger.error(f"设置输入状态失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -935,7 +1042,7 @@ def get_group_list(no_cache=False, bot_id=None):
 def get_group_info(group_id, bot_id=None):
     """获取群信息（owner_id/is_top/shut_up_* 等字段需要 LLBot 7.8 及以上版本）"""
     try:
-        return api("get_group_info", bot_id=bot_id, group_id=int(group_id))
+        return api("get_group_info", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取群信息失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -964,7 +1071,7 @@ def set_group_leave(group_id, is_dismiss=False, bot_id=None):
     """退出群聊（is_dismiss=True 时解散群，仅群主可用）"""
     try:
         return api("set_group_leave", bot_id=bot_id,
-                   group_id=int(group_id), is_dismiss=is_dismiss)
+                   group_id=_nid(group_id), is_dismiss=is_dismiss)
     except Exception as e:
         logger.error(f"退出群聊失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -974,7 +1081,7 @@ def set_group_admin(group_id, user_id, enable=True, bot_id=None):
     """设置群管理员（enable=True 设为管理员，False 取消管理员）"""
     try:
         return api("set_group_admin", bot_id=bot_id,
-                   group_id=int(group_id), user_id=int(user_id), enable=enable)
+                   group_id=_nid(group_id), user_id=_nid(user_id), enable=enable)
     except Exception as e:
         logger.error(f"设置群管理员失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -984,7 +1091,7 @@ def set_group_card(group_id, user_id, card, bot_id=None):
     """设置群成员名片（card 为空字符串表示取消群名片）"""
     try:
         return api("set_group_card", bot_id=bot_id,
-                   group_id=int(group_id), user_id=int(user_id), card=card)
+                   group_id=_nid(group_id), user_id=_nid(user_id), card=card)
     except Exception as e:
         logger.error(f"设置群名片失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -994,7 +1101,7 @@ def set_group_whole_ban(group_id, enable=True, bot_id=None):
     """群全体禁言（enable=True 开启，False 解除）"""
     try:
         return api("set_group_whole_ban", bot_id=bot_id,
-                   group_id=int(group_id), enable=enable)
+                   group_id=_nid(group_id), enable=enable)
     except Exception as e:
         logger.error(f"群全体禁言失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1003,7 +1110,7 @@ def set_group_whole_ban(group_id, enable=True, bot_id=None):
 def get_group_shut_list(group_id, bot_id=None):
     """获取被禁言群员列表"""
     try:
-        return api("get_group_shut_list", bot_id=bot_id, group_id=int(group_id))
+        return api("get_group_shut_list", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取被禁言群员列表失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1013,7 +1120,7 @@ def set_group_name(group_id, group_name, bot_id=None):
     """设置群名"""
     try:
         return api("set_group_name", bot_id=bot_id,
-                   group_id=int(group_id), group_name=group_name)
+                   group_id=_nid(group_id), group_name=group_name)
     except Exception as e:
         logger.error(f"设置群名失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1023,7 +1130,7 @@ def batch_delete_group_member(group_id, user_ids, bot_id=None):
     """批量踢出群成员（user_ids 为 QQ 号列表，需要 LLBot 5.6.0 及以上版本）"""
     try:
         return api("batch_delete_group_member", bot_id=bot_id,
-                   group_id=int(group_id), user_ids=[int(uid) for uid in user_ids])
+                   group_id=_nid(group_id), user_ids=[_nid(uid) for uid in user_ids])
     except Exception as e:
         logger.error(f"批量踢出群成员失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1033,7 +1140,7 @@ def get_group_honor_info(group_id, type="all", bot_id=None):
     """获取群荣誉（type 可选 talkative/performer/legend/strong_newbie/emotion/all）"""
     try:
         return api("get_group_honor_info", bot_id=bot_id,
-                   group_id=int(group_id), type=type)
+                   group_id=_nid(group_id), type=type)
     except Exception as e:
         logger.error(f"获取群荣誉失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1043,7 +1150,7 @@ def get_group_honor_info(group_id, type="all", bot_id=None):
 def get_essence_msg_list(group_id, bot_id=None):
     """获取群精华消息列表"""
     try:
-        return api("get_essence_msg_list", bot_id=bot_id, group_id=int(group_id))
+        return api("get_essence_msg_list", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取群精华消息列表失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1052,7 +1159,7 @@ def get_essence_msg_list(group_id, bot_id=None):
 def delete_essence_msg(message_id, bot_id=None):
     """删除群精华消息"""
     try:
-        return api("delete_essence_msg", bot_id=bot_id, message_id=int(message_id))
+        return api("delete_essence_msg", bot_id=bot_id, message_id=_nid(message_id))
     except Exception as e:
         logger.error(f"删除群精华消息失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1061,7 +1168,7 @@ def delete_essence_msg(message_id, bot_id=None):
 def get_group_at_all_remain(group_id, bot_id=None):
     """获取群 @全体成员 剩余次数"""
     try:
-        return api("get_group_at_all_remain", bot_id=bot_id, group_id=int(group_id))
+        return api("get_group_at_all_remain", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取群@全体成员剩余次数失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1072,7 +1179,7 @@ def send_group_notice(group_id, content, image=None, pinned=False, confirm_requi
     """发送群公告（image 支持 http:// / file:// / base64://）"""
     try:
         payload = {
-            "group_id": int(group_id),
+            "group_id": _nid(group_id),
             "content": content,
             "pinned": pinned,
             "confirm_required": confirm_required,
@@ -1091,7 +1198,7 @@ def send_group_notice(group_id, content, image=None, pinned=False, confirm_requi
 def get_group_notice(group_id, bot_id=None):
     """获取群公告列表"""
     try:
-        return api("_get_group_notice", bot_id=bot_id, group_id=int(group_id))
+        return api("_get_group_notice", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取群公告失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1101,7 +1208,7 @@ def delete_group_notice(group_id, notice_id, bot_id=None):
     """删除群公告（需要 LLOneBot 7.0.0 及以上版本）"""
     try:
         return api("_delete_group_notice", bot_id=bot_id,
-                   group_id=int(group_id), notice_id=str(notice_id))
+                   group_id=_nid(group_id), notice_id=str(notice_id))
     except Exception as e:
         logger.error(f"删除群公告失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1110,7 +1217,7 @@ def delete_group_notice(group_id, notice_id, bot_id=None):
 def set_group_sign(group_id, bot_id=None):
     """群打卡"""
     try:
-        return api("send_group_sign", bot_id=bot_id, group_id=int(group_id))
+        return api("send_group_sign", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"群打卡失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1119,7 +1226,7 @@ def set_group_sign(group_id, bot_id=None):
 def get_group_signed_list(group_id, bot_id=None):
     """获取群组今日打卡列表（需要 LLBot 8.0.0 及以上版本）"""
     try:
-        return api("get_group_signed_list", bot_id=bot_id, group_id=int(group_id))
+        return api("get_group_signed_list", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取群组今日打卡列表失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1130,7 +1237,7 @@ def set_group_msg_mask(group_id, mask, bot_id=None):
     """设置群消息接收方式（mask: 1 接收并提醒，2 收进群助手不提醒，3 屏蔽，4 接收不提醒）"""
     try:
         return api("set_group_msg_mask", bot_id=bot_id,
-                   group_id=int(group_id), mask=int(mask))
+                   group_id=_nid(group_id), mask=int(mask))
     except Exception as e:
         logger.error(f"设置群消息接收方式失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1140,7 +1247,7 @@ def set_group_remark(group_id, remark="", bot_id=None):
     """设置群备注（remark 为空字符串表示取消备注）"""
     try:
         return api("set_group_remark", bot_id=bot_id,
-                   group_id=int(group_id), remark=remark)
+                   group_id=_nid(group_id), remark=remark)
     except Exception as e:
         logger.error(f"设置群备注失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1149,7 +1256,7 @@ def set_group_remark(group_id, remark="", bot_id=None):
 def get_group_ignore_add_request(group_id, bot_id=None):
     """获取已过滤的加群通知"""
     try:
-        return api("get_group_ignore_add_request", bot_id=bot_id, group_id=int(group_id))
+        return api("get_group_ignore_add_request", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取已过滤的加群通知失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1159,7 +1266,7 @@ def upload_group_album(group_id, album_id, files, bot_id=None):
     """上传媒体到群相册（files 为字符串列表，元素支持 file:// / http:// / base64://）"""
     try:
         return api("upload_group_album", bot_id=bot_id,
-                   group_id=int(group_id), album_id=album_id, files=list(files))
+                   group_id=_nid(group_id), album_id=album_id, files=list(files))
     except Exception as e:
         logger.error(f"上传群相册失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1168,7 +1275,7 @@ def upload_group_album(group_id, album_id, files, bot_id=None):
 def get_group_album_list(group_id, bot_id=None):
     """获取群相册列表"""
     try:
-        return api("get_group_album_list", bot_id=bot_id, group_id=int(group_id))
+        return api("get_group_album_list", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取群相册列表失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1178,7 +1285,7 @@ def create_group_album(group_id, name, desc="", bot_id=None):
     """创建群相册"""
     try:
         return api("create_group_album", bot_id=bot_id,
-                   group_id=int(group_id), name=name, desc=desc)
+                   group_id=_nid(group_id), name=name, desc=desc)
     except Exception as e:
         logger.error(f"创建群相册失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1188,7 +1295,7 @@ def delete_group_album(group_id, album_id, bot_id=None):
     """删除群相册"""
     try:
         return api("delete_group_album", bot_id=bot_id,
-                   group_id=int(group_id), album_id=album_id)
+                   group_id=_nid(group_id), album_id=album_id)
     except Exception as e:
         logger.error(f"删除群相册失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1197,7 +1304,7 @@ def delete_group_album(group_id, album_id, bot_id=None):
 def get_group_album_media_list(group_id, album_id, attach_info=None, bot_id=None):
     """获取群相册媒体列表（attach_info 用于分页；需要 LLBot 7.12.3 及以上版本）"""
     try:
-        payload = {"group_id": int(group_id), "album_id": album_id}
+        payload = {"group_id": _nid(group_id), "album_id": album_id}
         if attach_info is not None:
             payload["attach_info"] = attach_info
         return api("get_group_album_media_list", bot_id=bot_id, **payload)
@@ -1217,7 +1324,7 @@ def set_group_portrait(group_id, file, bot_id=None):
                 logger.error(f"错误：头像文件不存在: {file}")
                 return {"status": "error", "message": "文件不存在"}
             file = "file:///" + os.path.abspath(file).replace("\\", "/")
-        return api("set_group_portrait", bot_id=bot_id, group_id=int(group_id), file=file)
+        return api("set_group_portrait", bot_id=bot_id, group_id=_nid(group_id), file=file)
     except Exception as e:
         logger.error(f"设置群头像失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1228,7 +1335,7 @@ def set_group_file_forever(group_id, file_id, bot_id=None):
     """群文件转永久（需要 LLOneBot 6.5.0 及以上版本）"""
     try:
         return api("set_group_file_forever", bot_id=bot_id,
-                   group_id=int(group_id), file_id=file_id)
+                   group_id=_nid(group_id), file_id=file_id)
     except Exception as e:
         logger.error(f"群文件转永久失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1238,7 +1345,7 @@ def delete_group_file(group_id, file_id, bot_id=None):
     """删除群文件（file_id 可在上报的上传文件消息中获取）"""
     try:
         return api("delete_group_file", bot_id=bot_id,
-                   group_id=int(group_id), file_id=file_id)
+                   group_id=_nid(group_id), file_id=file_id)
     except Exception as e:
         logger.error(f"删除群文件失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1247,7 +1354,7 @@ def delete_group_file(group_id, file_id, bot_id=None):
 def move_group_file(group_id, file_id, parent_directory, target_directory, bot_id=None):
     """移动群文件（parent_directory 当前文件夹 ID，target_directory 目标文件夹 ID）"""
     try:
-        return api("move_group_file", bot_id=bot_id, group_id=int(group_id), file_id=file_id,
+        return api("move_group_file", bot_id=bot_id, group_id=_nid(group_id), file_id=file_id,
                    parent_directory=parent_directory, target_directory=target_directory)
     except Exception as e:
         logger.error(f"移动群文件失败: {e}")
@@ -1258,7 +1365,7 @@ def create_group_file_folder(group_id, name, bot_id=None):
     """创建群文件文件夹（返回 data.folder_id）"""
     try:
         return api("create_group_file_folder", bot_id=bot_id,
-                   group_id=int(group_id), name=name)
+                   group_id=_nid(group_id), name=name)
     except Exception as e:
         logger.error(f"创建群文件文件夹失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1268,7 +1375,7 @@ def delete_group_folder(group_id, folder_id, bot_id=None):
     """删除群文件文件夹"""
     try:
         return api("delete_group_folder", bot_id=bot_id,
-                   group_id=int(group_id), folder_id=folder_id)
+                   group_id=_nid(group_id), folder_id=folder_id)
     except Exception as e:
         logger.error(f"删除群文件文件夹失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1277,7 +1384,7 @@ def delete_group_folder(group_id, folder_id, bot_id=None):
 def rename_group_file_folder(group_id, folder_id, new_folder_name, bot_id=None):
     """重命名群文件文件夹名"""
     try:
-        return api("rename_group_file_folder", bot_id=bot_id, group_id=int(group_id),
+        return api("rename_group_file_folder", bot_id=bot_id, group_id=_nid(group_id),
                    folder_id=folder_id, new_folder_name=new_folder_name)
     except Exception as e:
         logger.error(f"重命名群文件文件夹名失败: {e}")
@@ -1287,7 +1394,7 @@ def rename_group_file_folder(group_id, folder_id, new_folder_name, bot_id=None):
 def rename_group_file(group_id, file_id, current_parent_directory, new_name, bot_id=None):
     """重命名群文件名（需要 LLBot 7.10.1 及以上版本）"""
     try:
-        return api("rename_group_file", bot_id=bot_id, group_id=int(group_id), file_id=file_id,
+        return api("rename_group_file", bot_id=bot_id, group_id=_nid(group_id), file_id=file_id,
                    current_parent_directory=current_parent_directory, new_name=new_name)
     except Exception as e:
         logger.error(f"重命名群文件名失败: {e}")
@@ -1298,7 +1405,7 @@ def rename_group_file(group_id, file_id, current_parent_directory, new_name, bot
 def get_group_file_system_info(group_id, bot_id=None):
     """获取群文件系统信息（文件总数/上限、已用与总空间）"""
     try:
-        return api("get_group_file_system_info", bot_id=bot_id, group_id=int(group_id))
+        return api("get_group_file_system_info", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取群文件系统信息失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1307,7 +1414,7 @@ def get_group_file_system_info(group_id, bot_id=None):
 def get_group_root_files(group_id, bot_id=None):
     """获取群根目录文件列表（返回 data.files 与 data.folders）"""
     try:
-        return api("get_group_root_files", bot_id=bot_id, group_id=int(group_id))
+        return api("get_group_root_files", bot_id=bot_id, group_id=_nid(group_id))
     except Exception as e:
         logger.error(f"获取群根目录文件列表失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1317,7 +1424,7 @@ def get_group_files_by_folder(group_id, folder_id, bot_id=None):
     """获取群子目录文件列表（返回 data.files 与 data.folders）"""
     try:
         return api("get_group_files_by_folder", bot_id=bot_id,
-                   group_id=int(group_id), folder_id=folder_id)
+                   group_id=_nid(group_id), folder_id=folder_id)
     except Exception as e:
         logger.error(f"获取群子目录文件列表失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1327,7 +1434,7 @@ def get_group_file_url(group_id, file_id, bot_id=None):
     """获取群文件资源链接（返回 data.url）"""
     try:
         return api("get_group_file_url", bot_id=bot_id,
-                   group_id=int(group_id), file_id=file_id)
+                   group_id=_nid(group_id), file_id=file_id)
     except Exception as e:
         logger.error(f"获取群文件资源链接失败: {e}")
         return {"status": "error", "message": str(e)}
@@ -1353,7 +1460,7 @@ def upload_private_file(user_id, file, name, bot_id=None):
                 logger.error(f"文件不存在: {file}")
                 return {"status": "error", "message": "文件不存在"}
         return api("upload_private_file", bot_id=bot_id,
-                   user_id=int(user_id), file=file, name=name)
+                   user_id=_nid(user_id), file=file, name=name)
     except Exception as e:
         logger.error(f"上传私聊文件失败: {e}")
         return {"status": "error", "message": str(e)}

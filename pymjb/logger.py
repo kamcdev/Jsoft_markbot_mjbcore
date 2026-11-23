@@ -237,6 +237,9 @@ class _GroupErrorHandler(logging.Handler):
         try:
             # 延迟导入避免循环依赖（send 依赖 logger）
             from pymjb import send as _send, mjbconfig as _cfg
+            # coreset.dont_send_err 开启后只保留终端/文件输出，不再推群
+            if _cfg.get_dont_send_err():
+                return
             target_group = _cfg.get_target_group()
             if not target_group or target_group == "0":
                 return
@@ -272,6 +275,9 @@ def _forward_traceback(exc_type, exc_value, exc_tb):
         return
     try:
         from pymjb import send as _send, mjbconfig as _cfg
+        # coreset.dont_send_err 开启后只打印到终端，不再推群
+        if _cfg.get_dont_send_err():
+            return
         target_group = _cfg.get_target_group()
         if not target_group or target_group == "0":
             return
@@ -310,4 +316,12 @@ def setup_error_notify():
     logger.addHandler(handler)
 
     sys.excepthook = _uncaught_exception_handler
+
+    try:
+        from pymjb import mjbconfig as _cfg
+        if _cfg.get_dont_send_err():
+            info("错误转发到主群已关闭（coreset.dont_send_err=true，仅输出到终端与日志文件）")
+            return
+    except Exception:
+        pass
     info("错误转发到主群已启用")

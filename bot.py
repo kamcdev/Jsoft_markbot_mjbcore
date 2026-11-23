@@ -20,7 +20,7 @@ import crashhandler
 if __name__ == "__main__":
     crashhandler.bootstrap(__file__)
 
-from pymjb import logger, mjbconfig, send, worker, message, mjbc, socket, webmain
+from pymjb import logger, mjbconfig, send, worker, message, mjbc, socket, webmain, accountgate, filexfer
 
 
 # 模块根目录与包名（用于 importlib 导入 modules.<name>）
@@ -103,52 +103,70 @@ def _syntax_check(module_path):
     return (False, result.stderr.strip())
 
 
-def load_modules():
-    """扫描 modules/*.py，动态导入并注册命令。
+def _module_exists(mod_name):
+    """模块目录中是否存在该模块文件"""
+    if not mod_name or not mod_name.isidentifier() or mod_name == "__init__":
+        return False
+    return os.path.isfile(os.path.join(_MODULES_DIR, f"{mod_name}.py"))
 
-    - 排除 __init__.py 与 config/ 目录
-    - 用 importlib.import_module 导入每个模块
-    - 收集模块中所有 cmd_ 开头的可调用函数
-    - 对每个 cmd_xxx，同时注册 "xxx" 和 "cmd_xxx" 两个名称（兼容两种命令命名）
-    - 调用模块 init()（若存在），用于注册拦截器 / 启动后台线程
-    """
+
+def _list_module_files():
+    """列出模块目录中所有可加载的模块短名（排除 __init__.py 与子目录）"""
     if not os.path.isdir(_MODULES_DIR):
-        logger.warning(f"模块目录不存在: {_MODULES_DIR}")
-        return
-
-    # 清空自检失败项（reload 时也会重置）
-    _selfcheck_failures.clear()
-
-    loaded = 0
-    failed = 0
-
+        return []
+    names = []
     for fname in sorted(os.listdir(_MODULES_DIR)):
-        # 仅处理 .py 文件，自动排除 config/ 目录与子目录
-        if not fname.endswith(".py"):
+        if not fname.endswith(".py") or fname == "__init__.py":
             continue
-        if fname == "__init__.py":
-            continue
+        names.append(fname[:-3])
+    return names
 
-        mod_name = fname[:-3]
-        full_name = f"{_MODULES_PKG}.{mod_name}"
 
-        # 语法检查：在 import 之前用子进程校验模块语法
-        module_path = os.path.join(_MODULES_DIR, fname)
-        passed, error_msg = _syntax_check(module_path)
-        if not passed:
-            logger.error(f"模块 {mod_name} 语法检查失败:\n{error_msg}")
-            _selfcheck_failures.append(f"模块{mod_name}语法检查失败: {_oneline(error_msg)}")
-            failed += 1
-            continue
+def _validate_command_bindings():
+    """校验各账号 commands_map 中每条命令指向的函数是否已注册，未注册的移除"""
+    registered_funcs = mjbc.get_command_functions()
+    for bid in mjbconfig.get_account_list():
+        commands_map = mjbconfig.get_commands_map(bid)
+        invalid_triggers = []
+        for trigger, func_name in list(commands_map.items()):
+            if func_name not in registered_funcs:
+                logger.warning(f"账号{bid} 命令 '{trigger}' 指向的功能函数 '{func_name}' 未提供，已移除该命令")
+                _selfcheck_failures.append(f"账号{bid}命令{trigger}指向的功能函数{func_name}未提供")
+                invalid_triggers.append(trigger)
+        for trigger in invalid_triggers:
+            del commands_map[trigger]
 
-        try:
-            mod = importlib.import_module(full_name)
-        except Exception:
-            logger.error(f"加载模块失败: {mod_name}\n{traceback.format_exc()}")
-            _selfcheck_failures.append(f"模块{mod_name}加载失败: {_oneline(traceback.format_exc())}")
-            failed += 1
-            continue
 
+def _load_one_module(mod_name):
+    """导入并初始化单个模块（不涉及配置重载）
+
+    - 语法检查 → import → 注册命令 → 合并 autoreg → 调用 init()
+    - 全过程处于 worker.module_scope(mod_name) 中，使该模块注册的命令、线程、
+      拦截器都带上模块归属，供单模块重载精确回滚
+
+    Returns:
+        (ok: bool, message: str)
+    """
+    fname = f"{mod_name}.py"
+    module_path = os.path.join(_MODULES_DIR, fname)
+    full_name = f"{_MODULES_PKG}.{mod_name}"
+
+    # 语法检查：在 import 之前用子进程校验模块语法
+    passed, error_msg = _syntax_check(module_path)
+    if not passed:
+        logger.error(f"模块 {mod_name} 语法检查失败:\n{error_msg}")
+        _selfcheck_failures.append(f"模块{mod_name}语法检查失败: {_oneline(error_msg)}")
+        return False, f"模块 {mod_name} 语法检查失败: {_oneline(error_msg)}"
+
+    importlib.invalidate_caches()
+    try:
+        mod = importlib.import_module(full_name)
+    except Exception:
+        logger.error(f"加载模块失败: {mod_name}\n{traceback.format_exc()}")
+        _selfcheck_failures.append(f"模块{mod_name}加载失败: {_oneline(traceback.format_exc())}")
+        return False, f"模块 {mod_name} 加载失败: {_oneline(traceback.format_exc())}"
+
+    with worker.module_scope(mod_name):
         # 收集 cmd_ 开头的可调用对象，同时注册两种命名
         cmd_names = []
         reg_map = {}
@@ -188,22 +206,133 @@ def load_modules():
             except Exception:
                 logger.error(f"模块 [{mod_name}] init() 失败:\n{traceback.format_exc()}")
 
-        loaded += 1
+    return True, f"模块 {mod_name} 已载入"
+
+
+def load_modules():
+    """扫描 modules/*.py，动态导入并注册命令。
+
+    - 排除 __init__.py 与 config/ 目录
+    - 用 importlib.import_module 导入每个模块
+    - 收集模块中所有 cmd_ 开头的可调用函数
+    - 对每个 cmd_xxx，同时注册 "xxx" 和 "cmd_xxx" 两个名称（兼容两种命令命名）
+    - 调用模块 init()（若存在），用于注册拦截器 / 启动后台线程
+    """
+    if not os.path.isdir(_MODULES_DIR):
+        logger.warning(f"模块目录不存在: {_MODULES_DIR}")
+        return
+
+    # 清空自检失败项（reload 时也会重置）
+    _selfcheck_failures.clear()
+
+    loaded = 0
+    failed = 0
+
+    for mod_name in _list_module_files():
+        ok, _msg = _load_one_module(mod_name)
+        if ok:
+            loaded += 1
+        else:
+            failed += 1
 
     # 命令功能函数校验：检查各账号 commands_map 中每条命令的函数是否已注册
-    registered_funcs = mjbc.get_command_functions()
-    for bid in mjbconfig.get_account_list():
-        commands_map = mjbconfig.get_commands_map(bid)
-        invalid_triggers = []
-        for trigger, func_name in list(commands_map.items()):
-            if func_name not in registered_funcs:
-                logger.warning(f"账号{bid} 命令 '{trigger}' 指向的功能函数 '{func_name}' 未提供，已移除该命令")
-                _selfcheck_failures.append(f"账号{bid}命令{trigger}指向的功能函数{func_name}未提供")
-                invalid_triggers.append(trigger)
-        for trigger in invalid_triggers:
-            del commands_map[trigger]
+    _validate_command_bindings()
 
     logger.info(f"模块加载完成: 成功 {loaded} 个, 失败 {failed} 个")
+
+
+def load_new_modules():
+    """加载模块目录中新增但尚未载入的模块（mjb.reload new）
+
+    Returns:
+        (ok: bool, message: str)
+    """
+    if not os.path.isdir(_MODULES_DIR):
+        return False, f"模块目录不存在: {_MODULES_DIR}"
+
+    importlib.invalidate_caches()
+    new_names = [n for n in _list_module_files() if f"{_MODULES_PKG}.{n}" not in sys.modules]
+    if not new_names:
+        return True, "没有发现新增模块，模块目录中的模块均已载入"
+
+    logger.info(f"reload new: 发现 {len(new_names)} 个未载入模块: {', '.join(new_names)}")
+    loaded, fails = [], []
+    for mod_name in new_names:
+        ok, msg = _load_one_module(mod_name)
+        if ok:
+            loaded.append(mod_name)
+        else:
+            fails.append(msg)
+
+    _validate_command_bindings()
+
+    lines = []
+    if loaded:
+        lines.append(f"已加载新模块 {len(loaded)} 个：{', '.join(loaded)}")
+    if fails:
+        lines.append(f"加载失败 {len(fails)} 个：\n" + "\n".join(fails))
+    return (not fails), "\n".join(lines)
+
+
+def reload_module(mod_name):
+    """只重载指定模块（mjb.reload mod <模块名>）
+
+    流程：语法检查 → 停止该模块后台线程 → 清理其拦截器/命令 → 卸载模块
+          → 重新导入 → 注册命令 → 调用 init()
+
+    Returns:
+        (ok: bool, message: str)
+    """
+    mod_name = (mod_name or "").strip()
+    if not mod_name:
+        return False, "模块名错误：未提供模块名，可使用 mjb.mod list 查看已载入模块"
+    if mod_name == "__init__":
+        return False, "模块名错误：__init__ 不是可重载模块"
+    if not _module_exists(mod_name):
+        return False, f"模块名错误：{mod_name} 不存在，可使用 mjb.mod list 查看已载入模块"
+
+    full_name = f"{_MODULES_PKG}.{mod_name}"
+    was_loaded = full_name in sys.modules
+
+    # 1. 语法检查（失败则保持现有模块不变，避免改坏代码后模块直接消失）
+    passed, error_msg = _syntax_check(os.path.join(_MODULES_DIR, f"{mod_name}.py"))
+    if not passed:
+        logger.error(f"模块 {mod_name} 语法检查失败:\n{error_msg}")
+        return False, f"模块 {mod_name} 语法检查失败，未重载: {_oneline(error_msg)}"
+
+    if not was_loaded:
+        ok, msg = _load_one_module(mod_name)
+        if ok:
+            _validate_command_bindings()
+            return True, f"模块 {mod_name} 尚未载入，已直接加载"
+        return False, msg
+
+    logger.info(f"reload mod: 开始重载模块 [{mod_name}]")
+
+    # 2. 停止该模块归属的后台线程
+    stopped = worker.stop_module_background(mod_name, wait=True, timeout=5)
+
+    # 3. 清理该模块注册的拦截器/@bot 处理器/通知处理器
+    cleared = message.clear_module_handlers(mod_name)
+
+    # 4. 清理该模块注册的命令（若顶替了内置命令则恢复内置实现）
+    removed = mjbc.clear_module_commands(mod_name)
+
+    # 5. 从 sys.modules 卸载该模块及其子模块
+    for k in [k for k in list(sys.modules) if k == full_name or k.startswith(f"{full_name}.")]:
+        del sys.modules[k]
+    importlib.invalidate_caches()
+
+    # 6. 重新导入并初始化
+    ok, msg = _load_one_module(mod_name)
+    _validate_command_bindings()
+
+    if not ok:
+        return False, msg
+
+    logger.info(f"reload mod: 模块 [{mod_name}] 重载完成")
+    return True, (f"模块 {mod_name} 重载完成\n"
+                  f"停止线程 {stopped} 个 / 清理钩子 {cleared} 个 / 清理命令 {removed} 个")
 
 
 def cleanup(*_args):
@@ -267,6 +396,13 @@ def reload_all():
     mjbconfig.load()
     mjbconfig.reload()
 
+    # 5.1 重启账号门闸（stop_all_background 已停掉判定线程，此处幂等重启）
+    logger.info("reload: 重启账号门闸...")
+    try:
+        accountgate.start()
+    except Exception as e:
+        logger.error(f"reload: 重启账号门闸失败: {e}")
+
     # 6. 重新加载模块
     logger.info("reload: 重新加载模块...")
     load_modules()
@@ -278,6 +414,11 @@ def reload_all():
     # 8. 确保 WebUI 线程运行（热重载会停止后台线程，此处幂等重启，避免 WebUI 消失）
     logger.info("reload: 确保 WebUI 线程运行...")
     webmain.ensure_webui_thread()
+    # 官机模式文件外链的过期清理线程同样会被热重载停掉，这里一并拉起
+    try:
+        filexfer.ensure_cleanup_thread()
+    except Exception as e:
+        logger.error(f"reload: 重启官机模式文件清理线程失败: {e}")
 
     # 9. 重启 api 在线状态轮询线程（热重载已停止所有后台线程；存在 api 账号时重开）
     try:
@@ -310,14 +451,24 @@ def start():
     webmain.ensure_webui_thread()
     logger.info("WebUI 服务已启动（daemon 线程）")
 
+    # 官机模式文件外链的过期清理线程（启动时先扫一遍残留目录）
+    try:
+        filexfer.ensure_cleanup_thread()
+    except Exception as e:
+        logger.error(f"启动官机模式文件清理线程失败: {e}")
+
+    # 账号门闸：官方模式账号先判定为不存在，普通账号全部离线后才接管
+    # （必须在自检通知之前启动，否则会给未接入的官方账号发消息）
+    accountgate.start()
+
     # 启动自检通知（向各账号主群发送连接/自检提示，与 1.0.2 行为一致）
     _send_startup_notice()
 
     # 启用错误转发到主群（捕获 ERROR 日志与未捕获异常）
     logger.setup_error_notify()
 
-    # 注册 reload 回调（供 mjb.reload 命令调用）
-    mjbc.set_reload_callback(reload_all)
+    # 注册 reload 回调（供 mjb.reload 命令调用：all / new / mod <模块名>）
+    mjbc.set_reload_callback(reload_all, load_new=load_new_modules, reload_mod=reload_module)
 
     # 启动 api 在线状态轮询线程（存在 online_check=="api" 账号时）
     try:
@@ -343,6 +494,9 @@ def _send_startup_notice():
     """
     for bid in mjbconfig.get_account_list():
         try:
+            if mjbconfig.is_account_inactive(bid):
+                logger.info(f"账号{bid} 判定为不存在（账号门闸），跳过自检消息发送")
+                continue
             mjbconfig.set_current_bot_id(bid)
             target_group = mjbconfig.get_target_group()
             if not target_group or target_group == "0":

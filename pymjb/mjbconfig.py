@@ -6,7 +6,7 @@ import threading
 
 from pymjb import logger, kadset
 
-_MJBC_VER_RAW = "mjb-1.0.4.1(171)"
+_MJBC_VER_RAW = "mjb-1.0.4.2(193)"
 
 
 def get_mjbcver_raw():
@@ -47,6 +47,17 @@ def _kadset_file(path):
     if path.endswith(".json"):
         return path[:-len(".json")] + ".kadset"
     return path + ".kadset"
+
+
+def _as_bool(value, default=False):
+    """宽容的布尔解析（kadset 里可能是 true/false 或字符串）"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 def _read_config_file(path):
@@ -132,6 +143,35 @@ def get_ffmpeg_path(default=None):
 def get_bot_path(default=None):
     """读取全局 bot 根目录路径（coreset 的 bot_path 键）"""
     return get_coreset("bot_path", default)
+
+
+def get_webui_url(default=""):
+    """读取 WebUI 对外访问地址（coreset 的 webui_url 键）
+
+    只填主机部分（可带端口），不要带协议与末尾斜杠；
+    拼协议由 ``webui_https`` 决定，见 pymjb/filexfer.py。
+    """
+    value = get_coreset("webui_url", default)
+    if value is None:
+        return default
+    return str(value).strip().rstrip("/")
+
+
+def get_webui_https(default=False):
+    """读取 WebUI 对外是否使用 https（coreset 的 webui_https 键）"""
+    return _as_bool(get_coreset("webui_https", default), default)
+
+
+def get_official_mode(bot_id=None):
+    """读取账号的官方模式开关（coreset.account.<QQ>.official_mode，默认关闭）
+
+    官方模式为账号级开关：开启后该账号上报的十六进制群号/QQ号会被转成 30 位数字代理值
+    交给模块（见 pymjb/officialid.py），同时启用合并转发转图片与图片帮助。
+    """
+    resolved = _resolve_bot_id(bot_id)
+    if resolved is None:
+        return False
+    return _as_bool(_coreset_account_raw(resolved).get("official_mode", False))
 
 # ---- 运行时状态：每账号独立（config/<bot_id>/main/group.json）----
 _account_states = {}  # bot_id(str) -> state dict（见 _new_state）
@@ -233,6 +273,7 @@ def load_accounts():
                 "webhook_token": _norm_token(ports.get("webhook_token")),
                 "send_token": _norm_token(ports.get("send_token")),
                 "online_check": _norm_online_check(ports.get("online_check")),
+                "official_mode": _as_bool(ports.get("official_mode", False)),
             }
     if not _accounts:
         # 回退：从 config/ 目录自动发现账号
@@ -256,6 +297,7 @@ def _discover_accounts_from_config_dir():
                     "webhook_token": None,
                     "send_token": None,
                     "online_check": "heartbeat",
+                    "official_mode": False,
                 }
 
 
@@ -272,9 +314,17 @@ def get_account_list():
 
 
 def get_default_bot_id():
-    """默认账号 = coreset.account 第一个账号；无账号时回退 config/ 目录第一个子目录"""
+    """默认账号 = coreset.account 第一个判定上存在的账号
+
+    官方模式账号在被 accountgate 判定为"不存在"期间会被跳过，
+    避免无上下文的后台任务把消息发给未接入的账号。全部不可用时回退原第一个。
+    """
     accounts = get_accounts()
     if accounts:
+        inactive = get_inactive_accounts()
+        for bid in accounts:
+            if str(bid) not in inactive:
+                return bid
         return next(iter(accounts))
     if os.path.isdir(_CONFIG_DIR):
         for name in sorted(os.listdir(_CONFIG_DIR)):
@@ -282,6 +332,47 @@ def get_default_bot_id():
             if os.path.isdir(full) and name != "modcfg":
                 return name
     return None
+
+
+# ===================== 账号可用性（判定上"不存在"，由 accountgate 维护） =====================
+_inactive_accounts = set()  # 运行期判定为不存在的账号（不改配置文件）
+
+
+def set_inactive_accounts(ids):
+    """覆盖设置判定上"不存在"的账号集合（accountgate 调用）"""
+    global _inactive_accounts
+    _inactive_accounts = {str(i) for i in (ids or ()) if i is not None}
+
+
+def get_inactive_accounts():
+    """返回判定上"不存在"的账号集合（按当前账号列表过滤，忽略已删除账号）"""
+    if not _inactive_accounts:
+        return set()
+    live = {str(b) for b in get_account_list()}
+    return {b for b in _inactive_accounts if b in live}
+
+
+def is_account_inactive(bot_id):
+    """该账号当前是否判定为不存在（None 视为不存在与否无关，返回 False）"""
+    if bot_id is None:
+        return False
+    return str(bot_id) in get_inactive_accounts()
+
+
+def get_active_account_list():
+    """当前判定上存在的账号列表（排除 inactive）"""
+    inactive = get_inactive_accounts()
+    return [b for b in get_account_list() if str(b) not in inactive]
+
+
+def get_official_accounts():
+    """开启了 official_mode 的账号列表"""
+    return [b for b in get_account_list() if get_official_mode(b)]
+
+
+def get_non_official_accounts():
+    """未开启 official_mode 的账号列表"""
+    return [b for b in get_account_list() if not get_official_mode(b)]
 
 
 # ===================== 当前账号上下文（线程局部） =====================
@@ -302,11 +393,15 @@ def clear_current_bot_id():
 
 
 def _resolve_bot_id(bot_id=None):
-    """解析 bot_id：显式指定 > 当前线程上下文 > 默认账号"""
+    """解析 bot_id：显式指定 > 当前线程上下文 > 默认账号
+
+    线程上下文指向判定上不存在的账号时跳过（该账号已不接入），
+    避免后台任务把请求发往被门闸屏蔽的账号。
+    """
     if bot_id is not None:
         return str(bot_id)
     cur = get_current_bot_id()
-    if cur:
+    if cur and not is_account_inactive(cur):
         return cur
     return get_default_bot_id()
 
@@ -388,14 +483,32 @@ def _core_config_file(bot_id, name):
 
 
 # ===================== 端口与 API 地址 =====================
+def _coreset_account_raw(bot_id):
+    """coreset.account 中该账号的原始配置（未做默认值填充，键缺失即为 None）"""
+    raw = get_coreset("account", None)
+    if isinstance(raw, dict):
+        acc = raw.get(str(bot_id))
+        if isinstance(acc, dict):
+            return acc
+    return {}
+
+
+def _coreset_port(bot_id, key):
+    """读取 coreset.account 中显式配置的端口（未配置或非法返回 None）"""
+    val = _coreset_account_raw(bot_id).get(key)
+    if val is None or val == "":
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        logger.warning(f"账号{bot_id} coreset 中的 {key} 不是合法端口: {val}")
+        return None
+
+
 def _resolve_ports(bot_id):
-    """按优先级计算账号端口：coreset.account > group.json > 默认值"""
-    webhook_port = None
-    send_port = None
-    acc = get_accounts().get(str(bot_id), {})
-    if isinstance(acc, dict):
-        webhook_port = acc.get("webhook_port")
-        send_port = acc.get("send_port")
+    """按优先级计算账号端口：coreset.account 显式配置 > group.json > 默认值"""
+    webhook_port = _coreset_port(bot_id, "webhook_port")
+    send_port = _coreset_port(bot_id, "send_port")
     if webhook_port is None or send_port is None:
         gfile = _group_file(bot_id)
         if _config_file_exists(gfile):
@@ -416,36 +529,49 @@ def _resolve_ports(bot_id):
 
 
 def get_Onebot_url(bot_id=None):
-    state = _get_state(bot_id)
-    if state is not None and state["Onebot_URL"]:
-        return state["Onebot_URL"]
+    """发送接口地址：coreset 显式 send_port > 已加载的账号状态 > 默认值"""
     resolved = _resolve_bot_id(bot_id)
-    if resolved:
-        _, send_port = _resolve_ports(resolved)
-        return f"http://127.0.0.1:{send_port}"
+    if resolved is not None:
+        cfg_port = _coreset_port(resolved, "send_port")
+        if cfg_port is not None:
+            return f"http://127.0.0.1:{cfg_port}"
+        state = _account_states.get(resolved)
+        if state is not None and state.get("Onebot_URL"):
+            return state["Onebot_URL"]
+        return f"http://127.0.0.1:{_resolve_ports(resolved)[1]}"
     return f"http://127.0.0.1:{_DEFAULT_SEND_PORT}"
 
 
 def get_webhook_port(bot_id=None):
-    state = _get_state(bot_id)
-    if state is not None and state["webhook_port"]:
-        return state["webhook_port"]
+    """读取账号 Webhook 端口：coreset 显式配置 > 已加载的账号状态 > group.json > 默认值
+
+    账号状态在 group.json 缺失时会保持默认值，因此不能优先于 coreset，
+    否则多账号会全部退回 9762（端口冲突、上报串号）。
+    """
     resolved = _resolve_bot_id(bot_id)
-    if resolved:
-        webhook_port, _ = _resolve_ports(resolved)
-        return webhook_port
-    return _DEFAULT_WEBHOOK_PORT
+    if resolved is None:
+        return _DEFAULT_WEBHOOK_PORT
+    cfg_port = _coreset_port(resolved, "webhook_port")
+    if cfg_port is not None:
+        return cfg_port
+    state = _account_states.get(resolved)
+    if state is not None and state.get("webhook_port"):
+        return state["webhook_port"]
+    return _resolve_ports(resolved)[0]
 
 
 def get_send_port(bot_id=None):
-    state = _get_state(bot_id)
-    if state is not None and state["send_port"]:
-        return state["send_port"]
+    """读取账号 HTTP 发送端口：coreset 显式配置 > 已加载的账号状态 > group.json > 默认值"""
     resolved = _resolve_bot_id(bot_id)
-    if resolved:
-        _, send_port = _resolve_ports(resolved)
-        return send_port
-    return _DEFAULT_SEND_PORT
+    if resolved is None:
+        return _DEFAULT_SEND_PORT
+    cfg_port = _coreset_port(resolved, "send_port")
+    if cfg_port is not None:
+        return cfg_port
+    state = _account_states.get(resolved)
+    if state is not None and state.get("send_port"):
+        return state["send_port"]
+    return _resolve_ports(resolved)[1]
 
 
 def get_webhook_token(bot_id=None):
@@ -499,6 +625,15 @@ def has_invalid_online_check():
         if v not in ("heartbeat", "api"):
             return True
     return False
+
+
+def get_dont_send_err(default=False):
+    """是否关闭错误信息推送（coreset 的 dont_send_err 键，默认 False）
+
+    为 True 时 ERROR 日志与未捕获异常不再转发到推送群，终端与 log.log 照常输出。
+    每次调用都现读 coreset，改配置后热重载即可生效，无需重启。
+    """
+    return _as_bool(get_coreset("dont_send_err", default), default)
 
 
 def get_heart_patience(default=5):
@@ -612,6 +747,12 @@ def get_commandshidden(bot_id=None):
 
 
 def get_onimagehelp(bot_id=None):
+    """读取图片帮助开关
+
+    该账号开启 official_mode 时强制返回 True（仅判定层面生效，不改写配置文件）。
+    """
+    if get_official_mode(bot_id):
+        return True
     state = _get_state(bot_id)
     return state["onimagehelp"] if state else True
 
@@ -732,7 +873,7 @@ def _load_account(bot_id):
     try:
         if _config_file_exists(gfile):
             state["config"] = _read_config_file(gfile)
-            _apply_group_data(state, state["config"])
+            _apply_group_data(state, state["config"], bot_id)
             state["config_last_modified"] = _config_file_mtime(gfile)
             logger.info(f"账号{bot_id} 欢迎使用{state['botname']} {get_mjbcver_raw()}")
             logger.info(f"账号{bot_id} 已加载命令配置: {', '.join(state['commands_map'].keys())}")
@@ -778,7 +919,7 @@ def _reload_account(bot_id):
             logger.error(f"账号{bot_id} 未找到 group.json/group.kadset，无法重载")
             return False
         state["config"] = _read_config_file(gfile)
-        _apply_group_data(state, state["config"])
+        _apply_group_data(state, state["config"], bot_id)
         state["config_last_modified"] = _config_file_mtime(gfile)
         logger.info(f"账号{bot_id} 配置文件已重载")
         logger.info(
@@ -846,9 +987,14 @@ def _apply_autoreg_cache(state):
             state["commandshidden"].append(cmd)
 
 
-def _apply_group_data(state, group_data):
-    """根据当前账号 group.json dict 更新该账号全部运行时派生状态"""
+def _apply_group_data(state, group_data, bot_id=None):
+    """根据当前账号 group.json dict 更新该账号全部运行时派生状态
+
+    bot_id 为账号目录名（coreset.account 的键）；端口等账号级配置必须按它解析，
+    不能依赖 group.json 内的 bqq（从别的账号复制配置时 bqq 可能仍是旧 QQ 号）。
+    """
     state["botid"] = str(group_data.get("bqq", 0))
+    account_id = str(bot_id) if bot_id is not None else state["botid"]
     state["botname"] = str(group_data.get("botname", "mjbcore"))
     state["listening_qq_list"] = _to_list(group_data.get("listeningqq", ""))
     state["target_group"] = str(group_data.get("group", ""))
@@ -899,13 +1045,9 @@ def _apply_group_data(state, group_data):
         if not os.path.exists(state["webui_dir"]):
             state["webui_dir"] = None
 
-    # Webhook 端口和 HTTP 发送端口：coreset.account 优先、回退 group.json、再回退默认值
-    webhook_port = None
-    send_port = None
-    acc = get_accounts().get(state["botid"], {})
-    if isinstance(acc, dict):
-        webhook_port = acc.get("webhook_port")
-        send_port = acc.get("send_port")
+    # Webhook 端口和 HTTP 发送端口：coreset.account 显式配置优先、回退 group.json、再回退默认值
+    webhook_port = _coreset_port(account_id, "webhook_port")
+    send_port = _coreset_port(account_id, "send_port")
     if webhook_port is None:
         webhook_port = group_data.get("webhook_port", _DEFAULT_WEBHOOK_PORT)
     if send_port is None:

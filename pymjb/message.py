@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import datetime
 
-from pymjb import logger, mjbconfig, send, mjbc, mjbutils, worker
+from pymjb import logger, mjbconfig, send, mjbc, mjbutils, officialid, worker
 from pymjb import onebot_parse
 
 # 钩子注册表
@@ -204,6 +204,11 @@ def handle_event(data):
     本函数不再 set/clear 线程上下文，避免在异步任务/后台线程启动前过早清除，
     也避免与 worker.submit 的上下文管理产生冲突。
     """
+    # 账号门闸：判定上不存在的账号（官方/普通互斥）不处理任何事件
+    if mjbconfig.is_account_inactive(mjbconfig.get_current_bot_id()):
+        logger.debug(f"账号{mjbconfig.get_current_bot_id()} 判定为不存在，忽略事件")
+        return {"status": "ok"}
+
     post_type = data.get("post_type")
     if post_type == "message":
         message_type = data.get("message_type", "未知")
@@ -230,6 +235,9 @@ def handle_meta_event(data):
     except Exception as e:
         logger.error(f"元事件解析失败: {e}")
     if meta_event_type == "heartbeat":
+        # 判定上不存在的账号不写在线状态（WebUI 也不应看到它）
+        if mjbconfig.is_account_inactive(_get_heartbeat_key(data)):
+            return
         status = data.get("status", {})
         interval = data.get("interval", 0)
         key = _get_heartbeat_key(data)
@@ -269,6 +277,10 @@ def get_heartbeat_info(bot_id=None):
     """
     if bot_id is None:
         bot_id = mjbconfig.get_default_bot_id()
+    # 判定上不存在的账号：对外一律表现为不存在（离线 + 标记）
+    if mjbconfig.is_account_inactive(bot_id):
+        return {"online": False, "interval": 0, "timestamp": 0,
+                "raw_status": {}, "inactive": True}
     with _heartbeat_lock:
         info = _heartbeat_info.get(str(bot_id)) if bot_id is not None else None
         info = info.copy() if info else {}
@@ -285,6 +297,9 @@ def get_all_heartbeat_info():
     """
     with _heartbeat_lock:
         snapshot = {k: v.copy() for k, v in _heartbeat_info.items()}
+    # 判定上不存在的账号不出现在统计里（None 键为无账号旧场景，保留）
+    snapshot = {k: v for k, v in snapshot.items()
+                if k is None or not mjbconfig.is_account_inactive(k)}
     for k, v in snapshot.items():
         _expire_heartbeat(v, k)
     return snapshot
@@ -333,6 +348,8 @@ def _online_check_poll_loop(stop_event):
         for bid in mjbconfig.get_account_list():
             if stop_event.is_set():
                 return
+            if mjbconfig.is_account_inactive(bid):
+                continue  # 判定上不存在的账号不轮询
             if mjbconfig.get_online_check(bid) == "api":
                 _poll_api_status(bid, patience)
         stop_event.wait(patience)
@@ -383,9 +400,62 @@ def handle_request(data):
     handlers = _notice_handlers.get(request_type, []) or _notice_handlers.get(f"{request_type}_request", [])
     for fn in handlers:
         try:
-            fn(data)
+            fn(officialid.module_data(data))
         except Exception as e:
             logger.error(f"请求处理器({request_type})执行失败: {e}")
+
+
+def _normalize_slash_command(cmd_name):
+    """official 模式账号的斜杠指令：/help 与 help 等价
+
+    仅在该账号开启 official_mode 时生效；且只有去掉斜杠后确实是已注册命令才替换，
+    避免把 /tmp/a.txt 这类普通文本当成命令，影响后续关键词回复。
+    """
+    if not cmd_name.startswith("/"):
+        return cmd_name
+    if not mjbconfig.get_official_mode():
+        return cmd_name
+    stripped = cmd_name.lstrip("/")
+    if stripped and stripped in mjbconfig.get_commands_map():
+        return stripped
+    return cmd_name
+
+
+_CQ_AT_PATTERN = re.compile(r"\[CQ:at,([^\]]*)\]")
+
+
+def _parse_cq_at_params(body):
+    """解析 CQ:at 段的参数串（"qq=1,openid=AB,is_you=true" -> dict）"""
+    params = {}
+    for part in body.split(","):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        params[key.strip()] = value.strip()
+    return params
+
+
+def _detect_bot_at(raw_message, bot_ids, allow_is_you=False):
+    """检测消息里的 @bot 并返回去掉该 @ 段后的文本
+
+    官方版 OneBot 的 at 段是 [CQ:at,qq=<数字id>,openid=<官方id>,is_you=true]，
+    比普通版多了 openid/is_you 等参数，所以按参数名解析，而不是硬拼正则匹配整段。
+    判定顺序：qq 命中 Bot 已知 ID > openid 命中 > （official 模式）is_you=true。
+
+    Returns:
+        (is_at_bot: bool, content_without_at: str)
+    """
+    for match in _CQ_AT_PATTERN.finditer(raw_message):
+        params = _parse_cq_at_params(match.group(1))
+        qq = params.get("qq", "")
+        openid = params.get("openid", "")
+        hit = qq in bot_ids or (bool(openid) and openid in bot_ids)
+        if not hit and allow_is_you:
+            hit = params.get("is_you", "").lower() == "true"
+        if hit:
+            content = (raw_message[:match.start()] + raw_message[match.end():]).strip()
+            return True, content
+    return False, ""
 
 
 def handle_group_message(data):
@@ -395,10 +465,14 @@ def handle_group_message(data):
     raw_message = ctx["raw_message"]
     config_data = ctx["config_data"]
 
-    # 记录群-账号映射，供后台线程/定时任务中 send.group 无上下文时回退查找账号
-    self_id = data.get("self_id")
-    if self_id is not None and group_id is not None:
-        mjbconfig.register_group_account(group_id, self_id)
+    # 记录群-账号映射，供后台线程/定时任务中 send.group 无上下文时回退查找
+    # 官方版上报的 self_id 是十六进制串，无法与 coreset 账号键对应，优先用上报服务所属账号
+    account_id = mjbconfig.get_current_bot_id()
+    if account_id is None:
+        self_id = data.get("self_id")
+        account_id = str(self_id) if self_id is not None else None
+    if account_id is not None and group_id is not None:
+        mjbconfig.register_group_account(group_id, account_id)
 
     testmode = mjbconfig.get_testmode()
     testgp = mjbconfig.get_testgp()
@@ -408,14 +482,16 @@ def handle_group_message(data):
     logger.debug(f"群消息 群{group_id} {ctx['username']}({user_id}): {raw_message}")
 
     # 1. 消息拦截器（验证/dg/recall 等），按注册顺序执行
+    # 交给模块的是 ID 转换后的副本：官方账号拿到 30 位数字代理值，可直接 int()
+    hook_ctx = officialid.module_data(ctx)
     for fn in _interceptors:
         try:
-            if fn(ctx):
+            if fn(hook_ctx):
                 return
         except Exception as e:
             logger.error(f"消息拦截器执行失败: {e}")
 
-    # 2. @bot 检测
+    # 2. @bot 检测（official 模式下 at 段带 openid/is_you 等额外参数）
     bot_qq_numbers = []
     if config_data and "bqq" in config_data:
         bqq = config_data["bqq"]
@@ -426,23 +502,30 @@ def handle_group_message(data):
         else:
             bot_qq_numbers = [str(bqq)]
 
-    is_at_bot = False
-    at_content = ""
-    for bot_qq in bot_qq_numbers:
-        at_pattern = rf"\[CQ:at,qq={bot_qq}(?:,name=[^\]]*)?\]"
-        if re.search(at_pattern, raw_message):
-            is_at_bot = True
-            at_content = re.sub(rf"\[CQ:at,qq={bot_qq}(?:,name=[^\]]*)?\]\s*", "", raw_message).strip()
-            break
+    official_mode = mjbconfig.get_official_mode(account_id) if account_id else mjbconfig.get_official_mode()
+    bot_ids = set(bot_qq_numbers)
+    if account_id is not None:
+        bot_ids.add(str(account_id))
+    is_at_bot, at_content = _detect_bot_at(raw_message, bot_ids, allow_is_you=official_mode)
+
+    # official 模式：@bot 默认不再走 @bot 处理器，去掉 @ 段后的文本直接当命令解析；
+    # 只有内容以 ## 开头时才按 @bot 消息处理（## 本身不算内容）
+    at_to_command = False
+    if is_at_bot and official_mode:
+        if at_content.startswith("##"):
+            at_content = at_content[2:].strip()
+        else:
+            at_to_command = True
     ctx["is_at_bot"] = is_at_bot
     ctx["at_content"] = at_content
 
     # 3. 命令解析（首词匹配）
-    command_part = raw_message.strip()
+    command_part = at_content if at_to_command else raw_message.strip()
     special_commands = ["mjb.setnotice", "python.corun"]
     parts = command_part.split(maxsplit=1)
     if parts:
-        cmd_name = parts[0].strip()
+        # official 模式账号允许带斜杠调用命令（/help 等价 help）
+        cmd_name = _normalize_slash_command(parts[0].strip())
         if cmd_name in special_commands and len(parts) > 1:
             cmd_args = [parts[1]]
         else:
@@ -454,14 +537,14 @@ def handle_group_message(data):
     ctx["cmd_args"] = cmd_args
 
     # 4. @bot 处理（AI 等）
-    if is_at_bot and at_content:
+    if is_at_bot and at_content and not at_to_command:
         banned_users = mjbconfig.load_banuser()
         if user_id in banned_users:
             logger.info(f"用户{user_id}在bot黑名单中，忽略其@机器人消息")
             return
         for fn in _at_bot_handlers:
             try:
-                if fn(ctx):
+                if fn(officialid.module_data(ctx)):
                     return
             except Exception as e:
                 logger.error(f"@bot处理器执行失败: {e}")
@@ -507,6 +590,6 @@ def handle_notice(data):
     handlers = _notice_handlers.get(notice_type, [])
     for fn in handlers:
         try:
-            fn(data)
+            fn(officialid.module_data(data))
         except Exception as e:
             logger.error(f"通知处理器({notice_type})执行失败: {e}")

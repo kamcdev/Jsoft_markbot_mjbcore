@@ -55,12 +55,18 @@ def create_app(bot_id=None):
                     content={"status": "error", "message": "invalid token"},
                 )
 
-            # 记录该 app 的事件循环（供 run_on_main_thread 使用）
-            _loops[bot_id] = asyncio.get_running_loop()
-
             # 检查配置文件是否被修改，热重载
             if mjbconfig.check_modified(bot_id):
                 mjbconfig.reload(bot_id)
+
+            # 账号门闸：判定为不存在的账号（普通版与官方版互斥）直接丢弃上报。
+            # 仍然返回 ok，避免 OneBot 侧认为 webhook 故障而反复重试。
+            if mjbconfig.is_account_inactive(bot_id):
+                logger.debug(f"账号{bot_id} 判定为不存在，本次上报已忽略")
+                return {"status": "ok"}
+
+            # 记录该 app 的事件循环（供 run_on_main_thread 使用）
+            _loops[bot_id] = asyncio.get_running_loop()
 
             data = await request.json()
             logger.debug(f"收到上报消息: {data.get('post_type', '未知')}")
@@ -167,8 +173,18 @@ def run(port=None):
         _start_server(None, 9762)
         return
 
+    used_ports = {}
     for bot_id in accounts:
-        _start_server(bot_id, mjbconfig.get_webhook_port(bot_id))
+        port = mjbconfig.get_webhook_port(bot_id)
+        if port in used_ports:
+            # 同一端口无法启动两个上报服务，跳过并在启动阶段暴露配置错误
+            logger.error(
+                f"账号{bot_id} Webhook 端口 {port} 与账号{used_ports[port]} 重复，"
+                f"已跳过该账号的上报服务，请检查 coreset 的 webhook_port"
+            )
+            continue
+        used_ports[port] = bot_id
+        _start_server(bot_id, port)
 
 
 def wait():
