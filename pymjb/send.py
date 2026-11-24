@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 import os
 import requests
 
@@ -680,6 +681,140 @@ def private_json(user_id, data, bot_id=None):
     except Exception as e:
         logger.error(f"发送私聊卡片消息失败: {e}")
         return {"status": "error", "message": str(e)}
+
+
+# ---- QQ 官方 markdown 扩展（非 OneBot11 标准） ----
+def _resolve_markdown(markdown):
+    """解析 markdown 参数
+
+    支持三种写法，与 koishi-onebot 的扩展约定一致：
+      1. 对象：{content: "..."} 或 {custom_template_id: "...", params: [...]}
+      2. 纯字符串：当作 markdown.content
+      3. JSON 字符串：内容里带 content / custom_template_id / params 时按对象处理
+    """
+    if isinstance(markdown, dict):
+        return dict(markdown)
+    if isinstance(markdown, str):
+        if not markdown.strip():
+            raise ValueError("缺少 markdown 内容")
+        text = markdown.strip()
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict) and (
+                    "content" in parsed or "custom_template_id" in parsed or "params" in parsed):
+                return parsed
+        return {"content": markdown}
+    raise ValueError("markdown 需为对象、JSON 字符串或纯文本")
+
+
+def _resolve_keyboard(keyboard):
+    """解析按钮参数（keyboard / buttons）：对象原样，JSON 字符串转对象，无法解析时忽略"""
+    if isinstance(keyboard, dict):
+        return keyboard
+    if isinstance(keyboard, str) and keyboard.strip():
+        try:
+            parsed = json.loads(keyboard)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _markdown_payload(markdown, keyboard=None, summary=None):
+    """组装 markdown 扩展接口的公共参数（markdown + 可选按钮 / 摘要）"""
+    payload = {"markdown": _resolve_markdown(markdown)}
+    kb = _resolve_keyboard(keyboard)
+    if kb:
+        payload["keyboard"] = kb
+    if summary:
+        payload["text"] = str(summary)
+    return payload
+
+
+def send_markdown_msg(markdown, group_id=None, user_id=None, channel_id=None,
+                      message_type=None, keyboard=None, summary=None, bot_id=None):
+    """发送 markdown 消息（QQ 官方 msg_type=2 扩展接口，按目标自动判定类型）
+
+    Args:
+        markdown: 对象 {content} / 模板 {custom_template_id, params} / 纯字符串 / JSON 字符串
+        group_id / user_id / channel_id: 消息目标（至少给一个）
+        message_type: 显式指定 group / private / guild；省略时按给定目标推断
+        keyboard: 按钮对象或 JSON 字符串（也可用 buttons 形态的内容）
+        summary: 兜底摘要文本，作为 content 与 markdown 一起发出（给不支持 markdown 的客户端）
+
+    Returns:
+        dict: 接口原始返回（成功为 {"status": "ok", "data": {"message_id": ...}}）
+    """
+    try:
+        payload = _markdown_payload(markdown, keyboard, summary)
+        if channel_id is not None:
+            payload["channel_id"] = channel_id
+        if group_id is not None:
+            payload["group_id"] = _nid(group_id)
+        if user_id is not None:
+            payload["user_id"] = _nid(user_id)
+        if message_type is not None:
+            payload["message_type"] = message_type
+        elif group_id is not None:
+            payload["message_type"] = "group"
+        elif user_id is not None:
+            payload["message_type"] = "private"
+        elif channel_id is not None:
+            payload["message_type"] = "guild"
+        return api("send_markdown_msg", bot_id=bot_id, **payload)
+    except Exception as e:
+        logger.error(f"发送markdown消息失败: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def send_group_markdown_msg(group_id, markdown, keyboard=None, summary=None,
+                            channel_id=None, bot_id=None):
+    """发送群聊 markdown 消息（QQ 官方 msg_type=2 扩展接口，非 OneBot11 标准）
+
+    给了 channel_id 时按频道发送（官方频道），否则按群发送 group_id。
+    主动推送一般要求模板 markdown（custom_template_id），原生 content 受场景白名单限制，
+    被拒时返回里会透出 QQ 原始错误码。
+    """
+    try:
+        payload = _markdown_payload(markdown, keyboard, summary)
+        if channel_id is not None:
+            payload["channel_id"] = channel_id
+            payload["message_type"] = "guild"
+        else:
+            payload["group_id"] = _nid(group_id)
+            payload["message_type"] = "group"
+        return api("send_group_markdown_msg", bot_id=bot_id, **payload)
+    except Exception as e:
+        logger.error(f"发送群聊markdown消息失败: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def send_private_markdown_msg(user_id, markdown, keyboard=None, summary=None, bot_id=None):
+    """发送私聊 markdown 消息（QQ 官方 msg_type=2 扩展接口，非 OneBot11 标准）"""
+    try:
+        payload = _markdown_payload(markdown, keyboard, summary)
+        payload["user_id"] = _nid(user_id)
+        payload["message_type"] = "private"
+        return api("send_private_markdown_msg", bot_id=bot_id, **payload)
+    except Exception as e:
+        logger.error(f"发送私聊markdown消息失败: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# 与 group_json / private_json 命名风格对齐的短名别名
+def group_markdown(group_id, markdown, keyboard=None, summary=None, bot_id=None):
+    """发送群聊 markdown 消息（send_group_markdown_msg 的短名别名）"""
+    return send_group_markdown_msg(group_id, markdown, keyboard=keyboard,
+                                   summary=summary, bot_id=bot_id)
+
+
+def private_markdown(user_id, markdown, keyboard=None, summary=None, bot_id=None):
+    """发送私聊 markdown 消息（send_private_markdown_msg 的短名别名）"""
+    return send_private_markdown_msg(user_id, markdown, keyboard=keyboard,
+                                     summary=summary, bot_id=bot_id)
 
 
 def send_private_forward_msg(user_id, messages, fake_qq=None, fake_name=None, bot_id=None):

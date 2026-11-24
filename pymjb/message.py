@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import html
 import re
 import random
 import threading
@@ -187,19 +188,71 @@ def _handle_recall(ctx):
     return True
 
 
+def _html_unescape(text):
+    """还原 QQ 官方版对消息文本做的 HTML 实体转义
+
+    官方版适配器会把文本里的特殊字符转成实体（逗号 → `&#44;`、方括号 → `&#91;`/
+    `&#93;`、& → `&amp;` 等），而 CQ 码自身的参数不受影响。带 `&` 的文本不还原，
+    模块拿到的就是坏文本（最典型的是 python.corun 里的代码：`,` 变成 `&#44;`
+    直接语法错误，报 `'(' was never closed`）。所以进管线前统一还原一次。
+    """
+    if not isinstance(text, str) or "&" not in text:
+        return text
+    try:
+        return html.unescape(text)
+    except Exception:
+        return text
+
+
+def _unescape_segments(segments):
+    """还原消息段里文本类字段的 HTML 实体（text 段的 text、at 段的 name）"""
+    out = []
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            out.append(seg)
+            continue
+        data = dict(seg.get("data") or {})
+        for key in ("text", "name"):
+            if isinstance(data.get(key), str):
+                data[key] = _html_unescape(data[key])
+        item = dict(seg)
+        item["data"] = data
+        if isinstance(item.get("text"), str):
+            item["text"] = _html_unescape(item["text"])
+        out.append(item)
+    return out
+
+
 def _build_ctx(data, message_type):
-    """从 OneBot 事件构建上下文"""
+    """从 OneBot 事件构建上下文
+
+    官方模式账号的文本会被适配器转义成 HTML 实体（`,` → `&#44;` 等），
+    这里在进入拦截器/命令/@bot/关键词之前先还原，模块拿到的是原文。
+    """
     sender = data.get("sender", {})
+    # 账号键优先取上报服务所属账号（官方版 self_id 是十六进制串，对不上 coreset）
+    account = mjbconfig.get_current_bot_id()
+    if account is None:
+        self_id = data.get("self_id")
+        account = str(self_id) if self_id is not None else None
+    official_mode = mjbconfig.get_official_mode(account) if account is not None else False
+
+    raw_message = data.get("raw_message", "")
+    segments = onebot_parse.parse_segments(data.get("message"))
+    if official_mode:
+        raw_message = _html_unescape(raw_message)
+        segments = _unescape_segments(segments)
+
     return {
         "data": data,
         "message_type": message_type,
         "group_id": data.get("group_id"),
         "user_id": str(sender.get("user_id", "未知")),
         "username": sender.get("nickname", "未知"),
-        "raw_message": data.get("raw_message", ""),
+        "raw_message": raw_message,
         "message_id": data.get("message_id", "未知"),
         "config_data": mjbconfig.get_config(),
-        "segments": onebot_parse.parse_segments(data.get("message")),
+        "segments": segments,
     }
 
 
