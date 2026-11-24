@@ -6,7 +6,7 @@ import threading
 
 from pymjb import logger, kadset
 
-_MJBC_VER_RAW = "mjb-1.0.4.4(201)"
+_MJBC_VER_RAW = "mjb-1.0.4.5(205)"
 
 
 def get_mjbcver_raw():
@@ -172,6 +172,26 @@ def get_official_mode(bot_id=None):
     if resolved is None:
         return False
     return _as_bool(_coreset_account_raw(resolved).get("official_mode", False))
+
+def get_bind_official(bot_id=None, default=None):
+    """读取账号绑定的官机账号（coreset.account.<QQ>.bind_official，未配置返回 default）
+
+    值写数字（官机的账号键）或字符串都行，这里统一成账号键字符串返回；
+    0 / 空串 / false / none 视为未绑定。绑定关系只影响账号门闸的替补判定：
+    同一组「官机 + 绑定的普通账号」里，普通账号全部离线才让官机接管，
+    没有绑定关系的账号互不影响（见 pymjb/accountgate.py）。
+    """
+    resolved = _resolve_bot_id(bot_id)
+    if resolved is None:
+        return default
+    val = _coreset_account_raw(resolved).get("bind_official")
+    if val is None:
+        return default
+    text = str(val).strip()
+    if not text or text.lower() in ("0", "false", "none", "null"):
+        return default
+    return text
+
 
 # ---- 运行时状态：每账号独立（config/<bot_id>/main/group.json）----
 _account_states = {}  # bot_id(str) -> state dict（见 _new_state）
