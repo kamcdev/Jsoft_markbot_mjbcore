@@ -59,16 +59,21 @@ def create_app(bot_id=None):
             if mjbconfig.check_modified(bot_id):
                 mjbconfig.reload(bot_id)
 
-            # 账号门闸：判定为不存在的账号（普通版与官方版互斥）直接丢弃上报。
-            # 仍然返回 ok，避免 OneBot 侧认为 webhook 故障而反复重试。
+            data = await request.json()
+
+            # 账号门闸：判定为不存在的账号（普通版与官方版互斥）不处理业务事件。
+            # meta_event（心跳）仍要交给处理层：门闸靠它感知账号恢复在线，
+            # 否则被判离线的账号永远无法切回来。
+            # 两种情况都返回 ok，避免 OneBot 侧认为 webhook 故障而反复重试。
             if mjbconfig.is_account_inactive(bot_id):
-                logger.debug(f"账号{bot_id} 判定为不存在，本次上报已忽略")
+                if data.get("post_type") == "meta_event":
+                    worker.submit(_safe_handle, data, bot_id)
+                else:
+                    logger.debug(f"账号{bot_id} 判定为不存在，本次上报已忽略")
                 return {"status": "ok"}
 
             # 记录该 app 的事件循环（供 run_on_main_thread 使用）
             _loops[bot_id] = asyncio.get_running_loop()
-
-            data = await request.json()
             logger.debug(f"收到上报消息: {data.get('post_type', '未知')}")
 
             # 交由 worker 线程处理，避免阻塞事件循环（显式携带 bot_id）

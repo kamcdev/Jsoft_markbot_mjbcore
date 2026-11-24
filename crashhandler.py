@@ -42,6 +42,9 @@ STABLE_SECONDS = 60.0        # 工作进程存活超过该秒数视为已稳定�
 # 视为「正常退出」的退出码：0 / Ctrl+C 中断（130、Windows STATUS_CONTROL_C_EXIT）
 NORMAL_EXIT_CODES = frozenset({0, 130, -1073741510, 3221225786})
 
+# 主动重启（mjb.reboot）约定的特殊退出码：父进程收到后立即重启，不写崩溃报告、不计入连续崩溃
+EXIT_CODE_RESTART = 233
+
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 _LOG_DIR = os.path.join(_ROOT, "log")
 
@@ -295,6 +298,13 @@ def supervise(script, args=None):
             _cleanup_run_files(run_id)
             return 0
 
+        # 主动重启（mjb.reboot）：立即重启，不写崩溃报告、不计入连续崩溃
+        if exit_code == EXIT_CODE_RESTART:
+            _cleanup_run_files(run_id)
+            consecutive = 0
+            print("[crashhandler] 收到主动重启请求，立即重启主程序", file=sys.stderr, flush=True)
+            continue
+
         # 连续崩溃计数：上次运行足够久则视为已恢复
         if duration >= STABLE_SECONDS:
             consecutive = 0
@@ -322,6 +332,29 @@ def supervise(script, args=None):
 
 
 # ===================== 对外入口 =====================
+def request_restart():
+    """主动重启主程序（mjb.reboot 使用），不返回
+
+    - 处于守护状态：以 EXIT_CODE_RESTART 退出，守护父进程立即重新拉起工作进程
+    - 未处于守护状态：os.execv 用同一解释器与参数重新执行自身（等价 1.0.2 行为）
+    """
+    if is_supervised():
+        print("[crashhandler] 收到主动重启请求，交由守护父进程重启", file=sys.stderr, flush=True)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        if _fh_handle is not None:
+            try:
+                _fh_handle.flush()
+            except Exception:
+                pass
+        os._exit(EXIT_CODE_RESTART)
+
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 def bootstrap(script=None):
     """主程序启动时调用：按 coreset 配置决定是否进入崩溃守护
 

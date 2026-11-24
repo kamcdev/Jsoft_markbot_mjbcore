@@ -25,12 +25,19 @@ _heartbeat_info = {}  # bot_id -> {"online":bool,"interval":int,"timestamp":floa
 
 
 def _get_heartbeat_key(data):
-    """从心跳事件数据中解析账号 key（优先 self_id，回退当前线程上下文）"""
+    """从心跳事件数据中解析账号 key
+
+    优先用当前线程上下文（=上报服务所属的 coreset 账号键），再回退 self_id。
+    官方版上报的 self_id 是十六进制串，与 coreset 账号键对不上，若以它作 key，
+    官方账号的在线状态就永远查不到（门闸/WebUI 都会误判离线）。
+    """
+    cur = mjbconfig.get_current_bot_id()
+    if cur is not None:
+        return str(cur)
     self_id = data.get("self_id")
     if self_id is not None:
         return str(self_id)
-    cur = mjbconfig.get_current_bot_id()
-    return cur  # 可能为 None（旧场景）
+    return None  # 旧场景（无账号）
 
 
 def register_interceptor(fn):
@@ -204,9 +211,14 @@ def handle_event(data):
     本函数不再 set/clear 线程上下文，避免在异步任务/后台线程启动前过早清除，
     也避免与 worker.submit 的上下文管理产生冲突。
     """
-    # 账号门闸：判定上不存在的账号（官方/普通互斥）不处理任何事件
+    # 账号门闸：判定上不存在的账号（官方/普通互斥）不处理业务事件。
+    # 但 meta_event（心跳/lifecycle）必须放行：门闸要靠它感知该账号恢复在线，
+    # 否则判定结果会反过来污染判定输入，出现"官方接管后再也切不回普通账号"。
     if mjbconfig.is_account_inactive(mjbconfig.get_current_bot_id()):
-        logger.debug(f"账号{mjbconfig.get_current_bot_id()} 判定为不存在，忽略事件")
+        if data.get("post_type") == "meta_event":
+            handle_meta_event(data)
+        else:
+            logger.debug(f"账号{mjbconfig.get_current_bot_id()} 判定为不存在，忽略事件")
         return {"status": "ok"}
 
     post_type = data.get("post_type")
@@ -235,9 +247,9 @@ def handle_meta_event(data):
     except Exception as e:
         logger.error(f"元事件解析失败: {e}")
     if meta_event_type == "heartbeat":
-        # 判定上不存在的账号不写在线状态（WebUI 也不应看到它）
-        if mjbconfig.is_account_inactive(_get_heartbeat_key(data)):
-            return
+        # 注意：这里不做 inactive 过滤。门闸需要用真实心跳判断账号是否恢复，
+        # 而"判定上不存在"只是对外表现（get_heartbeat_info/get_all_heartbeat_info
+        # 会把 inactive 账号过滤成离线），原始状态必须照常记录。
         status = data.get("status", {})
         interval = data.get("interval", 0)
         key = _get_heartbeat_key(data)
@@ -255,7 +267,9 @@ def handle_meta_event(data):
 def _expire_heartbeat(info, bot_id=None):
     """对单个账号在线状态副本做超时检测
 
-    heartbeat 模式：等待心跳包的超时时间由全局 heart_patience 决定；
+    heartbeat 模式：等待心跳包的超时时间按账号自身 interval 动态放宽
+    （max(全局 heart_patience, interval*2+5) 秒），避免多账号心跳时刻天然错开
+    时被固定阈值误判离线；
     api 模式：不依赖心跳包，由轮询线程主动更新（此处不做超时判定）。
     """
     if bot_id is not None and mjbconfig.get_online_check(bot_id) == "api":
@@ -265,20 +279,28 @@ def _expire_heartbeat(info, bot_id=None):
         info["online"] = False
         return info
     threshold = mjbconfig.get_heart_patience()
+    try:
+        interval_ms = float(info.get("interval") or 0)
+    except (TypeError, ValueError):
+        interval_ms = 0.0
+    if interval_ms > 0:
+        threshold = max(threshold, interval_ms / 1000.0 * 2 + 5.0)
     if (datetime.now().timestamp() - ts) >= threshold:
         info["online"] = False
     return info
 
 
-def get_heartbeat_info(bot_id=None):
+def get_heartbeat_info(bot_id=None, ignore_gate=False):
     """获取指定账号在线状态副本（带超时检测）
 
     bot_id 为 None 时返回默认账号状态（向后兼容旧调用）。
+    ignore_gate=True 时跳开账号门闸过滤，读取真实在线状态——仅供门闸自身
+    做判定使用，避免"判定为不存在"导致读到的永远是离线，从而无法切回。
     """
     if bot_id is None:
         bot_id = mjbconfig.get_default_bot_id()
     # 判定上不存在的账号：对外一律表现为不存在（离线 + 标记）
-    if mjbconfig.is_account_inactive(bot_id):
+    if not ignore_gate and mjbconfig.is_account_inactive(bot_id):
         return {"online": False, "interval": 0, "timestamp": 0,
                 "raw_status": {}, "inactive": True}
     with _heartbeat_lock:
@@ -313,16 +335,25 @@ _online_poll_lock = threading.Lock()
 
 
 def _poll_api_status(bot_id, patience):
-    """对单个 api 模式账号请求 get_status 并写入在线状态副本（单次请求超时 = heart_patience）"""
+    """对单个 api 模式账号请求 get_status 并写入在线状态副本（单次请求超时 = heart_patience）
+
+    ignore_gate=True：即使该账号被门闸判定为"不存在"也要探测到真实状态，
+    否则它一被判定离线就再也探测不回来（门闸判定结果污染判定输入）。
+    """
     key = str(bot_id)
+    inactive = mjbconfig.is_account_inactive(bot_id)
     try:
-        resp = send._post("get_status", bot_id=bot_id, json={}, timeout=float(patience))
+        resp = send._post("get_status", bot_id=bot_id, json={},
+                          timeout=float(patience), ignore_gate=True)
         try:
             result = resp.json()
         except Exception:
             result = None
     except Exception as e:
-        logger.warning(f"账号[{key}] get_status 轮询失败: {e}")
+        if inactive:
+            logger.debug(f"账号[{key}] get_status 探测失败（当前判定为不存在）: {e}")
+        else:
+            logger.warning(f"账号[{key}] get_status 轮询失败: {e}")
         result = None
     data = result.get("data", {}) if isinstance(result, dict) else {}
     online = bool(data.get("online", False)) if isinstance(data, dict) else False
@@ -348,8 +379,9 @@ def _online_check_poll_loop(stop_event):
         for bid in mjbconfig.get_account_list():
             if stop_event.is_set():
                 return
-            if mjbconfig.is_account_inactive(bid):
-                continue  # 判定上不存在的账号不轮询
+            # 注意：不跳过被门闸判定为"不存在"的账号。
+            # api 方案没有被动心跳，只能靠主动探测；一旦跳过，被判离线的账号
+            # 就永远测不到恢复，官方接管后便无法切回普通账号。
             if mjbconfig.get_online_check(bid) == "api":
                 _poll_api_status(bid, patience)
         stop_event.wait(patience)

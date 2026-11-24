@@ -32,11 +32,13 @@ def _restore_ids(obj):
     return obj
 
 
-def _resolve_bot(bot_id=None, group_id=None):
+def _resolve_bot(bot_id=None, group_id=None, ignore_gate=False):
     """解析目标账号：显式 bot_id > （无线程上下文时）group_id 映射 > 当前上下文/默认账号
 
     bot_id 为 None 且当前线程无账号上下文时，根据 group_id 查找关联账号
-    （用于后台线程/定时任务中模块无上下文调用 send.group 的回退场景）
+    （用于后台线程/定时任务中模块无上下文调用 send.group 的回退场景）。
+    ignore_gate=True 时不做账号门闸回退——仅供框架自身的在线探测使用，
+    否则被判"不存在"的账号会被换成默认账号，探测结果就测到别人头上。
     """
     if bot_id is None and group_id is not None:
         if mjbconfig.get_current_bot_id() is None:
@@ -44,31 +46,34 @@ def _resolve_bot(bot_id=None, group_id=None):
             if mapped:
                 bot_id = mapped
     # 判定上不存在的账号（账号门闸互斥）不能作为发送目标，回退到当前可用账号
-    if bot_id is not None and mjbconfig.is_account_inactive(bot_id):
+    if not ignore_gate and bot_id is not None and mjbconfig.is_account_inactive(bot_id):
         bot_id = None
     return bot_id
 
 
-def _url(action, bot_id=None, group_id=None):
+def _url(action, bot_id=None, group_id=None, ignore_gate=False):
     """构造 OnebotQQ API 地址"""
-    return f"{mjbconfig.get_Onebot_url(_resolve_bot(bot_id, group_id))}/{action}"
+    return f"{mjbconfig.get_Onebot_url(_resolve_bot(bot_id, group_id, ignore_gate))}/{action}"
 
 
-def _headers(bot_id=None, group_id=None):
+def _headers(bot_id=None, group_id=None, ignore_gate=False):
     """按账号配置构造请求头：设置了 send_token 时附带 Authorization: Bearer <token>"""
-    token = mjbconfig.get_send_token(_resolve_bot(bot_id, group_id))
+    token = mjbconfig.get_send_token(_resolve_bot(bot_id, group_id, ignore_gate))
     if not token:
         return None
     return {"Authorization": f"Bearer {token}"}
 
 
-def _post(action, bot_id=None, group_id=None, **kwargs):
-    """统一 API POST 入口：按账号自动附带 token（未配置 token 时不携带）"""
+def _post(action, bot_id=None, group_id=None, ignore_gate=False, **kwargs):
+    """统一 API POST 入口：按账号自动附带 token（未配置 token 时不携带）
+
+    ignore_gate 仅供框架内部在线探测使用，模块请勿传入。
+    """
     if "json" in kwargs:
         kwargs["json"] = _restore_ids(kwargs["json"])
     return requests.post(
-        _url(action, bot_id, group_id),
-        headers=_headers(bot_id, group_id),
+        _url(action, bot_id, group_id, ignore_gate),
+        headers=_headers(bot_id, group_id, ignore_gate),
         **kwargs
     )
 

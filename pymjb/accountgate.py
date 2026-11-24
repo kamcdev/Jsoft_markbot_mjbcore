@@ -30,9 +30,14 @@ def _grace_seconds():
 
 
 def _is_online(bot_id):
-    """读取账号在线状态（heartbeat/api 两种方案统一走 message 的副本）"""
+    """读取账号真实在线状态（heartbeat/api 两种方案统一走 message 的副本）
+
+    必须 ignore_gate=True：本函数是门闸的判定输入，若走带门闸过滤的查询，
+    一旦账号被判"不存在"就读到恒为离线的假状态，判定结果会锁死自己，
+    普通账号恢复后也无法切回（官方接管后再也回不来）。
+    """
     try:
-        return bool(message.get_heartbeat_info(bot_id).get("online", False))
+        return bool(message.get_heartbeat_info(bot_id, ignore_gate=True).get("online", False))
     except Exception:
         return False
 
@@ -97,7 +102,7 @@ def evaluate(force=False):
 
     force=True 时跳过宽限期与去抖，立即按当前状态切换（供启动/重载内部使用）。
     """
-    accounts, _officials, _normals = _classify()
+    accounts, officials, normals = _classify()
     signature = tuple(accounts)
 
     with _LOCK:
@@ -122,7 +127,10 @@ def evaluate(force=False):
             _STATE["pending"] = set(desired)
             _STATE["pending_count"] = 1
 
-        if not force and _STATE["pending_count"] < CONFIRM_TIMES:
+        # 恢复方向（普通账号重新在线、官方退回不存在）是安全切换，立即生效；
+        # 只有切向官方（普通账号全部离线）才去抖，避免心跳抖动导致来回抢线。
+        safe_switch = bool(officials) and desired == set(officials)
+        if not force and not safe_switch and _STATE["pending_count"] < CONFIRM_TIMES:
             return False
 
         return _apply(desired)
@@ -141,8 +149,8 @@ def _loop(stop_event):
 def start():
     """启动账号门闸（幂等）
 
-    首次启动：官方账号立刻判定为不存在，随后进入宽限期；
-    热重载后重启：保留现有判定集合，只重置宽限期。
+    首次启动：官方账号立刻判定为不存在，随后进入宽限期（等普通账号上报首个心跳）；
+    热重载后重启：保留现有判定集合与心跳历史，无需宽限，立即按现状判定。
     """
     global _THREAD
     with _LOCK:
@@ -156,12 +164,15 @@ def start():
             mjbconfig.set_inactive_accounts(target)
             _STATE["inactive"] = set(target)
             _STATE["signature"] = tuple(accounts)
+            _STATE["ready_at"] = time.time() + _grace_seconds()
             if target:
                 logger.info("账号门闸：官方账号 %s 暂不接入，优先使用未启用官方模式的账号"
                             % ", ".join(sorted(target)))
             else:
                 logger.info("账号门闸：未启用官方模式的账号不存在或未配置官方账号，全部账号正常接入")
-        _STATE["ready_at"] = time.time() + _grace_seconds()
+        else:
+            # 热重载：心跳数据仍在，立即允许判定，恢复即切
+            _STATE["ready_at"] = 0.0
 
     _STOP.clear()
     _THREAD = worker.start_background(GATE_NAME, _loop, stop_event=_STOP)
