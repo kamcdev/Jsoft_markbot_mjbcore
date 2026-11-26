@@ -334,6 +334,64 @@ def send_group_file(group_id, file_path, file_name=None, folder_id=None, bot_id=
         return (False, str(e))
 
 
+# ---- 视频消息（普通号与官机通用） ----
+# OneBot 实现普遍按 100MB 截断视频消息，超过就只能发文件了
+MAX_VIDEO_BYTES = 100 * 1024 * 1024
+
+
+def send_group_video(group_id, file_path, bot_id=None, timeout=300):
+    """发送群聊视频消息（video 消息段，普通号与官机通用）
+
+    与 send_group_file 的官机外链分流不同，这里**始终**发 video 消息段：
+    官方适配器会把本地文件上传成视频（file_type=2），所以官机模式下也能直接
+    收到视频本体，不需要走取件链接。
+
+    Args:
+        group_id: 目标群号
+        file_path: 本地视频文件路径（建议 .mp4）
+        bot_id: 指定发送账号，省略则按线程上下文 / 群映射解析
+        timeout: 上传超时（秒），大文件上传远比文本慢
+
+    Returns:
+        tuple: (是否成功, 错误信息或"成功")
+    """
+    try:
+        if not file_path or not os.path.exists(file_path):
+            logger.error(f"视频文件不存在: {file_path}")
+            return (False, "文件不存在")
+        size = os.path.getsize(file_path)
+        if size <= 0:
+            logger.error(f"视频文件为空: {file_path}")
+            return (False, "视频文件为空")
+        if size > MAX_VIDEO_BYTES:
+            logger.error(f"视频文件超过 100MB（{size} 字节）: {file_path}")
+            return (False, "视频超过 100MB，请压缩后再发")
+
+        payload = {
+            "group_id": _nid(group_id),
+            "message": [{"type": "video",
+                         "data": {"file": os.path.abspath(file_path)}}],
+        }
+        response = _post("send_group_msg", bot_id, group_id, json=payload, timeout=timeout)
+        if response.status_code != 200:
+            return (False, f"HTTP状态码: {response.status_code}")
+        try:
+            result = response.json()
+        except Exception:
+            return (False, "接口返回非 JSON")
+        if result.get("status") == "ok" or result.get("retcode") == 0:
+            logger.info(f"群视频发送成功到群{group_id}: "
+                        f"{os.path.basename(file_path)}（{size / 1048576:.1f}MB）")
+            return (True, "成功")
+        return (False, str(result.get("message") or result.get("wording") or result))
+    except requests.exceptions.Timeout:
+        logger.error("群视频发送超时")
+        return (False, "上传超时，视频可能过大或网络较慢")
+    except Exception as e:
+        logger.error(f"发送群视频失败: {e}")
+        return (False, str(e))
+
+
 # ---- OnebotQQ API 封装 ----
 def get_group_member_role(group_id, user_id, bot_id=None):
     """获取群成员身份：owner/admin/member/unknown"""

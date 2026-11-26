@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+import ast
 import os
+import re
 import json
 import random
 import datetime
@@ -379,10 +381,230 @@ def cmd_status(group_id, user_id, config_data, *args):
     return "已发送系统状态信息"
 
 
+# 公告里是否含 markdown 语法的判定规则（按行首/局部特征匹配，普通文本不会误判）
+_MD_PATTERNS = (
+    re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+\S", re.M),        # 标题
+    re.compile(r"^[ \t]{0,3}(?:```|~~~)"),                # 代码块围栏
+    re.compile(r"`[^`\n]+`"),                             # 行内代码
+    re.compile(r"\*\*[^*\n]+\*\*"),                       # **粗体**
+    re.compile(r"~~[^~\n]+~~"),                           # ~~删除线~~
+    re.compile(r"(?<![\w*])\*[^*\s][^*\n]*\*(?![\w*])"),   # *斜体*
+    re.compile(r"^[ \t]{0,3}[-*+][ \t]+\S", re.M),        # 无序列表
+    re.compile(r"^[ \t]{0,3}\d{1,3}\.[ \t]+\S", re.M),    # 有序列表
+    re.compile(r"^[ \t]{0,3}>[ \t]?\S", re.M),            # 引用
+    re.compile(r"!?\[[^\]\n]*\]\([^)\n]+\)"),             # 链接 / 图片
+    re.compile(r"^[ \t]{0,3}\|.+\|", re.M),               # 表格
+)
+
+
+def _has_markdown(text):
+    """粗略判定文本是否含 markdown 语法"""
+    if not text:
+        return False
+    return any(p.search(text) for p in _MD_PATTERNS)
+
+
+def _plain_summary(text, limit=60):
+    """把 markdown 公告压成一行纯文本，作为 markdown 消息的兜底摘要"""
+    s = re.sub(r"!?\[([^\]\n]*)\]\([^)\n]+\)", r"\1", text or "")
+    s = re.sub(r"[`*_~>#|]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:limit] + ("…" if len(s) > limit else "")
+
+
+def _markdown_ok(resp):
+    """发送接口返回是否成功（status=ok 或 retcode=0）"""
+    if not isinstance(resp, dict):
+        return False
+    if str(resp.get("status", "")).lower() == "ok":
+        return True
+    return resp.get("retcode") == 0
+
+
+def _json_literals_to_python(text):
+    """把 JSON 的 true/false/null 换成 Python 字面量（字符串内部不动）"""
+    literals = {"true": "True", "false": "False", "null": "None"}
+    out = []
+    i, n = 0, len(text)
+    quote = None
+    while i < n:
+        ch = text[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        replaced = False
+        for lit, py in literals.items():
+            if text.startswith(lit, i):
+                before = text[i - 1] if i > 0 else ""
+                end = i + len(lit)
+                after = text[end] if end < n else ""
+                if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+                    out.append(py)
+                    i = end
+                    replaced = True
+                    break
+        if not replaced:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _literal_container(text):
+    """解析 JSON / Python 字面量容器（dict / list），失败返回 None"""
+    s = (text or "").strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    try:
+        return ast.literal_eval(_json_literals_to_python(s))
+    except Exception:
+        return None
+
+
+def _parse_notice_spec(content):
+    """解析「完整 markdown 公告」，返回 {"markdown", "keyboard", "summary"} 或 None
+
+    支持两种写法（可原样贴进 mjb.setnotice / 存进 current_notice）：
+      1. markdown={"content": "..."}, keyboard={"content": {...}}, summary="..."
+      2. {"markdown": {...}, "keyboard": {...}, "summary": "..."}
+    只做字面量解析（ast.literal_eval），不执行任何代码；按钮与摘要缺省时不带上。
+    """
+    text = (content or "").strip()
+    if not text:
+        return None
+
+    spec = None
+    if text.startswith("{"):
+        obj = _literal_container(text)
+        if isinstance(obj, dict):
+            if isinstance(obj.get("markdown"), (dict, str)):
+                spec = obj
+            elif "content" in obj or "custom_template_id" in obj:
+                # 只给了 markdown 对象（没有外层 markdown= 键）
+                spec = {"markdown": obj}
+    elif re.match(r"(?is)^markdown\s*=", text):
+        node = None
+        # 兼容：字符串里写的是真实换行（直接贴多行文本）而不是 \n 转义
+        for candidate in (text, text.replace("\r\n", "\n").replace("\n", "\\n")):
+            try:
+                node = ast.parse("_mjbc_notice(" + _json_literals_to_python(candidate) + ")",
+                                 mode="eval").body
+                break
+            except SyntaxError:
+                node = None
+        if isinstance(node, ast.Call) and not node.args and node.keywords:
+            spec = {}
+            for kw in node.keywords:
+                if kw.arg is None:
+                    return None
+                try:
+                    spec[kw.arg] = ast.literal_eval(kw.value)
+                except Exception:
+                    return None
+
+    if not isinstance(spec, dict):
+        return None
+
+    md = spec.get("markdown")
+    if isinstance(md, str):
+        if not md.strip():
+            return None
+        # markdown 也可能被写成 JSON 字符串 {"content": "..."}
+        parsed = _literal_container(md) if md.lstrip().startswith("{") else None
+        md = parsed if isinstance(parsed, dict) else md
+    elif not isinstance(md, dict):
+        return None
+    if isinstance(md, dict):
+        body = md.get("content")
+        tpl = md.get("custom_template_id")
+        if not ((isinstance(body, str) and body.strip())
+                or (isinstance(tpl, str) and tpl.strip())):
+            return None
+
+    out = {"markdown": md}
+
+    keyboard = spec.get("keyboard", spec.get("buttons"))
+    if isinstance(keyboard, str):
+        keyboard = _literal_container(keyboard)
+    if isinstance(keyboard, dict):
+        out["keyboard"] = keyboard
+
+    summary = spec.get("summary", spec.get("text"))
+    if isinstance(summary, str) and summary.strip():
+        out["summary"] = summary
+    return out
+
+
+def _notice_spec_text(spec):
+    """取完整公告里的纯正文，用于回退到聊天记录时不要露出 markdown={...} 原文"""
+    md = spec.get("markdown")
+    if isinstance(md, str):
+        return md
+    if isinstance(md, dict):
+        content = md.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if md.get("custom_template_id"):
+            return f"[模板公告] {md.get('custom_template_id')}"
+    return ""
+
+
+def _send_notice(group_id, content, title="公告", fake_name="公告推送"):
+    """发送公告：官机 + markdown（含完整 markdown/keyboard/summary 写法）→ markdown 消息
+
+    普通账号、或正文不含 markdown 语法时，仍发合并转发（官机自动转成聊天记录图片）。
+    账号取触发这条消息的账号（线程上下文优先，回退群-账号映射/默认账号）；
+    markdown 被 QQ 拒绝或接口报错时自动退回聊天记录，公告不会丢。
+
+    Returns:
+        "markdown" / "forward"
+    """
+    content = "" if content is None else str(content)
+    spec = _parse_notice_spec(content)
+    bot_id = send._resolve_bot(None, group_id)
+
+    if mjbconfig.get_official_mode(bot_id) and (spec or _has_markdown(content)):
+        if spec:
+            md = spec["markdown"]
+            keyboard = spec.get("keyboard")
+            summary = spec.get("summary") or _plain_summary(_notice_spec_text(spec))
+        else:
+            # 自带标题就直接用，否则补一个一级标题，避免正文顶格
+            md = content if _MD_PATTERNS[0].match(content) else f"# {title}\n\n{content}"
+            keyboard = None
+            summary = _plain_summary(content)
+        resp = send.send_group_markdown_msg(
+            group_id, md, keyboard=keyboard, summary=summary, bot_id=bot_id)
+        if _markdown_ok(resp):
+            logger.info(f"公告以 markdown 形式发送到群{group_id}")
+            return "markdown"
+        logger.warning(f"markdown 公告发送失败，改为聊天记录发送: {resp}")
+
+    # 回退：完整公告只取正文文本，避免群里看到 markdown={...} 原文
+    body = _notice_spec_text(spec) if spec else content
+    send.send_group_forward_msg(group_id, [f"【{title}】\n{body}"], fake_name=fake_name)
+    return "forward"
+
+
 def cmd_notice(group_id, user_id, config_data, *args):
     """查看当前公告"""
     current_notice = config_data.get("current_notice", "暂无公告")
-    send.send_group_forward_msg(group_id, [f"【当前公告】\n{current_notice}"], fake_name="公告查询")
+    _send_notice(group_id, current_notice, title="当前公告", fake_name="公告查询")
     return "已发送当前公告"
 
 
@@ -1032,15 +1254,19 @@ def cmd_setnotice(group_id, user_id, config_data, *args):
     notice_message = "管理员发布了新的公告,请及时查看bot新修改"
 
     success_count = 0
+    markdown_count = 0
     for target_group in notice_list:
         try:
             send.group(target_group, notice_message)
-            send.send_group_forward_msg(target_group, [f"【公告】\n{notice_content}"], fake_name="公告推送")
+            if _send_notice(target_group, notice_content, title="公告", fake_name="公告推送") == "markdown":
+                markdown_count += 1
             success_count += 1
         except Exception as e:
             logger.error(f"向群{target_group}发送公告失败: {e}")
 
     result_message = f"公告推送完成，成功发送到{success_count}个群"
+    if markdown_count:
+        result_message += f"（其中{markdown_count}个群以markdown发送）"
     send.group(group_id, result_message)
     return result_message
 
